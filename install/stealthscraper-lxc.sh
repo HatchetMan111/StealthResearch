@@ -105,9 +105,12 @@ install_inner() {
   python3 -m venv "$APP_DIR/venv"
   "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
   "$APP_DIR/venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+  # Browser in den App-Ordner (nicht /root/.cache!) -- der Service läuft als
+  # User 'scraper' und käme sonst nicht an die Binarys ran.
+  export PLAYWRIGHT_BROWSERS_PATH="$APP_DIR/pw-browsers"
   msg_info "Installiere Chromium für Playwright (einmalig, dauert)..."
   "$APP_DIR/venv/bin/playwright" install --with-deps chromium
-  msg_ok "Chromium bereit"
+  msg_ok "Chromium bereit ($APP_DIR/pw-browsers)"
 
   mkdir -p "$APP_DIR/data/results"
   if [[ -f "$APP_DIR/config.yaml" ]]; then
@@ -127,6 +130,14 @@ install_inner() {
   systemctl enable --now stealth-scraper-check.timer
   # Neustart nach Update, damit neuer Code aktiv ist (systemd --now ist No-Op wenn schon läuft)
   systemctl restart stealth-scraper.service || true
+  # Nie blind "läuft" melden: prüfen, ob der Port wirklich antwortet.
+  sleep 3
+  if ! systemctl is-active --quiet stealth-scraper.service; then
+    msg_error "Service läuft NICHT! Letzte Logs:"
+    journalctl -u stealth-scraper.service -n 20 --no-pager >&2 || true
+    msg_error "Danach erneut Installer laufen lassen oder manuell: systemctl status stealth-scraper.service"
+    exit 1
+  fi
   msg_ok "API läuft (Port 8001)"
 
   IP=$(hostname -I | awk '{print $1}')

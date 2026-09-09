@@ -5,4 +5,5 @@ Description=StealthScraper-LXC Target-Check (alle aktiven Targets)
 Type=oneshot
 User=scraper
 WorkingDirectory=/opt/stealth-scraper
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/stealth-scraper/pw-browsers
 ExecStart=/opt/stealth-scraper/venv/bin/python -m app.main --target all --config config.yaml
