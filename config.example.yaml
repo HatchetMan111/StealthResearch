@@ -38,3 +38,28 @@ targets:
     selectors:          # optional eigene Selektoren (überschreiben Auto-Erkennung)
       preis: ".price"
       verfuegbarkeit: ".stock"
+
+# Schnäppchen-Watcher: Such-URLs regelmäßig prüfen, Deals per Median erkennen.
+# Ablauf: im Browser filtern (Suchbegriff, PLZ + Umkreis z.B. 10 km, Preis,
+# "Neueste zuerst") -> URL kopieren -> als Watch anlegen (Dashboard Sektion 4
+# oder hier). Gleiches Prinzip für alle Anbieter (kleinanzeigen, mobile.de,
+# autoscout24, ebay, idealo, generisch mit eigenen Selektoren).
+watcher:
+  enabled: true
+  db_path: "data/deals.db"
+
+watches:
+  - name: "beispiel-watch"
+    enabled: false
+    provider: "auto"   # oder kleinanzeigen/mobile/autoscout/ebay/idealo/generisch
+    search_url: "https://www.kleinanzeigen.de/s-laptop/12345-musterstadt/preis::500/..."
+    query: "Laptop"    # nur Doku/Anzeige
+    plz: "12345"       # nur Doku/Anzeige
+    radius_km: 10      # nur Doku/Anzeige (Umkreis steckt in der kopierten URL)
+    max_preis: 500
+    deal_schwelle_prozent: 25  # X % unter Median = Deal (UNTER_MARKT)
+    min_angebote: 5            # Mindest-Treffer mit Preis für verlässlichen Median
+    max_seiten: 2              # Trefferseiten pro Prüfung (max. 5)
+    interval_minutes: 60       # Prüf-Abstand dieser Suche (min. 15, Bot-Schutz!)
+    notify_webhook: ""         # optional: POST als JSON bei neuen Deals
+    selectors: {}              # optional eigene Selektoren (item/titel/preis/link/ort)

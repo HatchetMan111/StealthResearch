@@ -9,6 +9,12 @@ import yaml
 DEFAULTS: dict = {}
 
 
+def resolve_config_path() -> Path:
+    """config.yaml neben app/ bevorzugen, sonst CWD (identisch zu server.py)."""
+    here = Path(__file__).resolve().parent.parent / "config.yaml"
+    return here if here.exists() else Path("config.yaml")
+
+
 def load_config(path: str | Path = "config.yaml") -> dict:
     p = Path(path)
     cfg: dict = {}
@@ -22,3 +28,10 @@ def load_config(path: str | Path = "config.yaml") -> dict:
     if port and str(port).isdigit():
         cfg.setdefault("server", {})["port"] = int(port)
     return cfg
+
+
+def save_config(cfg: dict, path: str | Path | None = None) -> None:
+    """Schreibt cfg als YAML zurück (für Dashboard-CRUD: watches)."""
+    p = Path(path) if path else resolve_config_path()
+    p.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
+                 encoding="utf-8")

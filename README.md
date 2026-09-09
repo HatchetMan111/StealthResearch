@@ -40,10 +40,43 @@ curl -X POST http://$IP:8001/scrape \
 
 # Alle Targets aus config.yaml prüfen (+ JSON-Ablage in data/results/)
 curl -X POST http://$IP:8001/targets/check
+
+# Schnäppchen-Watch anlegen (läuft danach automatisch im Intervall)
+curl -X POST http://$IP:8001/watches \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"thinkpad-10km","search_url":"https://www.kleinanzeigen.de/s-laptop/...r10",
+       "query":"ThinkPad","plz":"10115","radius_km":10,"max_preis":500,
+       "deal_schwelle_prozent":25,"interval_minutes":60}'
+# Deals abrufen / Watch sofort prüfen
+curl "http://$IP:8001/deals?limit=20"
+curl -X POST http://$IP:8001/watches/thinkpad-10km/run
 ```
 
 Auth (nur wenn `api_token` gesetzt): Header `X-Token: ...` mitsenden.
 Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Research-LXC.
+
+## Schnäppchen-Watcher (Kleinanzeigen & Co.)
+
+Prinzip — für **alle Anbieter gleich**:
+
+1. Im Browser filtern: Suchbegriff, **PLZ + Umkreis** (z.B. 10 km), ggf. Preis,
+   Sortierung „Neueste zuerst“.
+2. Die fertige **Such-URL kopieren** und als Watch anlegen (Dashboard Sektion 4
+   oder API `/watches`).
+3. Das System prüft die URL automatisch im eingestellten **Abstand pro Watch**
+   (`interval_minutes`, Minimum 15 — Bot-Schutz!), sammelt die Treffer,
+   berechnet den **Median** und meldet Inserate **X % darunter als Deal**
+   (`UNTER_MARKT`) sowie deutliche **Preissenkungen** (`PREISSENKUNG`).
+4. Optional: `notify_webhook` (z.B. ntfy/Discord) bekommt neue Deals als POST.
+
+Vorkonfiguriert: `kleinanzeigen`, `mobile`, `autoscout`, `ebay`, `idealo`,
+`generisch` (eigene Selektoren). Neuer Anbieter = 10 Zeilen in
+`app/providers.py` (`PROVIDERS`-Eintrag mit Item-/Titel-/Preis-/Link-Selektoren).
+Deal-Historie in `data/deals.db`, einsehbar unter `GET /deals` bzw. Dashboard.
+
+Fair use: Intervalle nicht zu aggressiv wählen (mind. 15–30 Min pro Suche),
+`robots.txt`/AGB beachten — Kleinanzeigen bannt bei Dauerfeuer schnell die IP,
+ggf. Proxy in `config.yaml` eintragen.
 
 ## Zusammenspiel mit BraveResearchProxmox
 

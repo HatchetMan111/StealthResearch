@@ -101,3 +101,27 @@ def extract_with_selectors(html: str, selectors: dict[str, str]) -> dict[str, st
             el = None
         out[field] = el.get_text(" ", strip=True) if el else ""
     return out
+
+
+def parse_preis(text: str) -> float | None:
+    """Deutschen Preis-String -> float (EUR). 'VB'/'Tausch'/leer -> None, 'verschenken' -> 0.0."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    if any(w in t for w in ("verschenk", "gratis", "kostenlos")):
+        return 0.0
+    if any(w in t for w in ("vb", "tausch", "anfrage", "preisvorschlag")) and not re.search(r"\d", t):
+        return None
+    m = re.search(r"(\d[\d\s.]*)[,.](\d{2})\b", t)
+    if m:
+        try:
+            return float(re.sub(r"[\s.]", "", m.group(1)) + "." + m.group(2))
+        except ValueError:
+            return None
+    m = re.search(r"\b(\d[\d\s.]*)\s*(€|eur)", t)
+    if m:
+        try:
+            return float(re.sub(r"[\s.]", "", m.group(1)))
+        except ValueError:
+            return None
+    return None

@@ -4,3 +4,4 @@ venv/
 config.yaml
 data/cache.db
 data/results/
+data/deals.db
