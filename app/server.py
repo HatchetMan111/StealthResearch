@@ -237,6 +237,136 @@ async def deals_list(watch: str | None = None, limit: int = 50,
     return JSONResponse(WDB.deals(watch or None, max(1, min(limit, 200))))
 
 
+# ---------- Einstellungen: alles über Web UI (wie BraveResearch /settings) ----------
+def apply_settings(data: dict) -> dict:
+    """Validiert + klemmt Settings-Payload. Port bleibt fix (Restart-Thema entfällt)."""
+    data = data or {}
+    s_in = data.get("server", {}) or {}
+    c_in = data.get("scraper", {}) or {}
+    cache_in = data.get("cache", {}) or {}
+    w_in = data.get("watcher", {}) or {}
+
+    def _int(v, default, lo, hi):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(v, hi))
+
+    def _float(v, default, lo, hi):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(v, hi))
+    return {
+        "server": {"api_token": str(s_in.get("api_token", "") or "")[:200]},
+        "scraper": {
+            "timeout_seconds": _int(c_in.get("timeout_seconds", 30), 30, 5, 120),
+            "extra_wait_ms": _int(c_in.get("extra_wait_ms", 1500), 1500, 0, 10000),
+            "headless": bool(c_in.get("headless", True)),
+            "locale": str(c_in.get("locale", "de-DE") or "de-DE")[:20],
+            "timezone": str(c_in.get("timezone", "Europe/Berlin") or "Europe/Berlin")[:50],
+            "viewport_width": _int(c_in.get("viewport_width", 1366), 1366, 800, 3840),
+            "viewport_height": _int(c_in.get("viewport_height", 768), 768, 600, 2160),
+            "user_agent": str(c_in.get("user_agent", "") or "")[:500],
+            "block_images": bool(c_in.get("block_images", True)),
+            "proxy": str(c_in.get("proxy", "") or "")[:300],
+        },
+        "cache": {"ttl_hours": _float(cache_in.get("ttl_hours", 6), 6, 0, 720)},
+        "watcher": {"enabled": bool(w_in.get("enabled", True))},
+    }
+
+
+def _apply_live(cisclean: dict) -> None:
+    """Übernimmt Settings sofort ins laufende System (ohne Neustart)."""
+    CFG.setdefault("server", {})["api_token"] = cisclean["server"]["api_token"]
+    CFG.setdefault("scraper", {}).update(cisclean["scraper"])
+    CFG.setdefault("cache", {})["ttl_hours"] = cisclean["cache"]["ttl_hours"]
+    CFG.setdefault("watcher", {})["enabled"] = cisclean["watcher"]["enabled"]
+    s = CFG["scraper"]
+    SCRAPER.timeout = int(s.get("timeout_seconds", 30)) * 1000
+    SCRAPER.extra_wait = int(s.get("extra_wait_ms", 1500))
+    CACHE.ttl = float(CFG["cache"].get("ttl_hours", 6)) * 3600
+    # Hinweis: headless wirkt erst nach Service-Neustart (Browser läuft bereits).
+
+
+@app.get("/settings/data")
+async def settings_data(x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    cfg = _fresh_cfg()
+    s, sc, c, w = (cfg.get("server", {}) or {}, cfg.get("scraper", {}) or {},
+                   cfg.get("cache", {}) or {}, cfg.get("watcher", {}) or {})
+    return JSONResponse({
+        "port": (CFG.get("server", {}) or {}).get("port", 8001),
+        "server": {"api_token": s.get("api_token", "")},
+        "scraper": {k: sc.get(k) for k in ("timeout_seconds", "extra_wait_ms", "headless",
+                    "locale", "timezone", "viewport_width", "viewport_height",
+                    "user_agent", "block_images", "proxy")},
+        "cache": {"ttl_hours": c.get("ttl_hours", 6)},
+        "watcher": {"enabled": w.get("enabled", True)},
+    })
+
+
+@app.post("/settings/save")
+async def settings_save(payload: dict, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    payload = payload or {}
+    clean = apply_settings(payload)
+    cfg = _fresh_cfg()
+    # Token nur anfassen, wenn das Formular ihn mitgeschickt hat (sonst behalten)
+    if "server" in payload:
+        cfg.setdefault("server", {})["api_token"] = clean["server"]["api_token"]
+    else:
+        clean["server"]["api_token"] = (cfg.get("server", {}) or {}).get("api_token", "")
+    old_headless = bool((cfg.get("scraper", {}) or {}).get("headless", True))
+    cfg.setdefault("scraper", {}).update(clean["scraper"])
+    cfg.setdefault("cache", {})["ttl_hours"] = clean["cache"]["ttl_hours"]
+    cfg.setdefault("watcher", {})["enabled"] = clean["watcher"]["enabled"]
+    save_config(cfg, CONFIG_PATH)
+    _apply_live(cisclean)
+    return {"ok": True,
+            "restart_needed": clean["scraper"]["headless"] != old_headless,
+            "hinweis": ("Headless geändert: 'systemctl restart stealth-scraper.service' nötig."
+                        if clean["scraper"]["headless"] != old_headless
+                        else "Alle Werte sofort aktiv.")}
+
+
+class TargetReq(BaseModel):
+    name: str = ""
+    url: str = ""
+    wait_for: str = ""
+    selectors: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/targets")
+async def target_create(req: TargetReq, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    name, url = req.name.strip(), req.url.strip()
+    if not name or len(name) > 60:
+        raise HTTPException(status_code=400, detail="Name fehlt/ungültig")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL muss mit http(s):// beginnen")
+    cfg = _fresh_cfg()
+    targets = cfg.get("targets", []) or []
+    if any(t.get("name") == name for t in targets):
+        raise HTTPException(status_code=409, detail="Target existiert bereits")
+    targets.append({"name": name, "url": url, "wait_for": req.wait_for.strip(),
+                    "selectors": dict(req.selectors or {})})
+    cfg["targets"] = targets
+    save_config(cfg, CONFIG_PATH)
+    return {"ok": True}
+
+
+@app.delete("/targets/{name}")
+async def target_delete(name: str, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    cfg = _fresh_cfg()
+    cfg["targets"] = [t for t in (cfg.get("targets", []) or []) if t.get("name") != name]
+    save_config(cfg, CONFIG_PATH)
+    return {"ok": True}
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -254,10 +384,12 @@ table{border-collapse:collapse;width:100%;margin-top:.5em}
 td,th{border:1px solid #444;padding:.4em .6em;text-align:left;font-size:.9em}
 th{background:#222;color:#bbb}pre{background:#0d0d0d;padding:.7em;overflow:auto;border-radius:6px;font-size:.8em}
 .ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#999;font-size:.85em}
+a{color:#7fdc7f}
 .badge{display:inline-block;background:#1b5e20;border-radius:10px;padding:.1em .6em;font-size:.85em}
 @media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}}
 </style></head><body>
 <h1>StealthScraper-LXC</h1>
+<p><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></p>
 
 <div class="card"><h3>1. Seite pr&uuml;fen</h3>
 <label>URL</label>
@@ -289,7 +421,16 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <div><button id="b_targets" class="sec">Alle aktiven Targets pr&uuml;fen</button>
 <button id="b_hist" class="sec">Verlauf laden</button>
 <button id="b_cache" class="warn">Cache leeren</button></div>
-<div id="targets"></div><div id="hist"></div></div>
+<div id="targets"></div><div id="hist"></div>
+<details><summary>Target anlegen / l&ouml;schen</summary>
+<div class="grid">
+<div><label>Name</label><input id="t_name" type="text" placeholder="shop-xyz"></div>
+<div><label>Warten auf Selektor (optional)</label><input id="t_wait" type="text" placeholder=".price"></div>
+</div>
+<label>URL</label><input id="t_url" type="text" placeholder="https://shop.example/produkt/1">
+<div><button id="b_tsave" class="sec">Target speichern</button>
+<button id="b_tlist" class="sec">Targets laden</button></div>
+<div id="tlist"></div></details></div>
 
 <div class="card"><h3>4. Schn&auml;ppchen-Watcher</h3>
 <p class="mut">Im Browser filtern (Suchbegriff, PLZ + Umkreis, Preis, &bdquo;Neueste zuerst&ldquo;),
@@ -362,6 +503,19 @@ if(!d.length){$('hist').innerHTML='<span class="mut">Keine Verlaufsdaten.</span>
 let h='';d.forEach(f=>{h+='<details><summary>'+esc(f.datei)+' ('+f.eintraege.length+' Eintr&auml;ge)</summary><pre>'+esc(JSON.stringify(f.eintraege,null,2).slice(0,4000))+'</pre></details>';});
 $('hist').innerHTML=h;}catch(e){$('hist').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}};
 $('b_cache').onclick=async()=>{try{await fetch('/cache',{method:'DELETE',headers:hdr()});alert('Cache geleert');}catch(e){alert('Fehler: '+e.message);}};
+$('b_tsave').onclick=async()=>{const b={name:$('t_name').value.trim(),url:$('t_url').value.trim(),wait_for:$('t_wait').value.trim()};
+if(!b.name||!b.url){alert('Name und URL ausfüllen');return;}
+try{const r=await fetch('/targets',{method:'POST',headers:hdr(),body:JSON.stringify(b)});const d=await r.json();
+if(!r.ok)throw new Error(d.detail||r.status);$('t_name').value='';$('t_url').value='';loadTargets();}catch(e){alert('Fehler: '+e.message);}};
+async function loadTargets(){try{const r=await fetch('/targets',tokQ());const d=await r.json();
+if(!d.length){$('tlist').innerHTML='<p class="mut">Keine Targets.</p>';return;}
+let h='<table><tr><th>Name</th><th>URL</th><th>Aktion</th></tr>';
+d.forEach(t=>{h+='<tr><td>'+esc(t.name)+'</td><td><span class="mut">'+esc((t.url||'').slice(0,70))+'&hellip;</span></td>'
++'<td><button class="warn" onclick="delTarget(\\''+esc(t.name)+'\\')">L&ouml;schen</button></td></tr>';});
+h+='</table>';$('tlist').innerHTML=h;}catch(e){$('tlist').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
+async function delTarget(n){if(!confirm('Target \\''+n+'\\' löschen?'))return;
+try{await fetch('/targets/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadTargets();}catch(e){alert('Fehler: '+e.message);}}
+$('b_tlist').onclick=loadTargets;loadTargets();
 async function loadProviders(){try{const r=await fetch('/providers',tokQ());const d=await r.json();
 const s=$('w_provider');d.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=p.label;if(p.key==='generisch')o.textContent+=' (alle anderen Shops)';s.appendChild(o);});}catch(e){}}
 function wBody(){const v=id=>$(id).value.trim();
@@ -398,6 +552,91 @@ h+='</table>';$('deals').innerHTML=h;}catch(e){$('deals').innerHTML='<span class
 $('b_deals').onclick=loadDeals;
 loadProviders();loadWatches();loadDeals();
 </script></body></html>"""
+
+
+SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Einstellungen &middot; StealthScraper-LXC</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:900px;margin:1.5em auto;padding:0 1em;background:#111;color:#eee}
+.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:1em;margin-bottom:1em}
+label{display:block;margin:.5em 0 .2em;color:#bbb;font-size:.9em}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;box-sizing:border-box;background:#0d0d0d;color:#eee;border:1px solid #444;border-radius:6px;padding:.5em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.5em 1em}
+button{background:#2e7d32;color:#fff;border:0;border-radius:6px;padding:.6em 1em;margin:.4em .3em .1em 0;cursor:pointer}
+button.sec{background:#333}.ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#999;font-size:.85em}
+a{color:#7fdc7f}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style></head><body>
+<h1>Einstellungen</h1>
+<p><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></p>
+<div id="msg"></div>
+<div class="card"><h3>Server</h3>
+<div class="grid">
+<div><label>Port (nur Anzeige &mdash; &Auml;nderung per config.yaml + Neustart)</label><input id="g_port" type="text" disabled></div>
+<div><label>API-Token (leer = kein Auth, nur Heimnetz!)</label><input id="g_token_new" type="password" placeholder="Nur bei Änderung ausfüllen">
+<label><input id="g_tokclear" type="checkbox"> Token komplett entfernen</label>
+</div>
+</div>
+<label>Gespeicherter Token (Anzeige)</label><input id="g_token_saved" type="text" disabled>
+<p class="mut">Achtung: Nach Token-&Auml;nderung hier oben unter &bdquo;Start&ldquo; den neuen Token eintragen (wird im Browser gespeichert).</p>
+</div>
+<div class="card"><h3>Scraper</h3>
+<div class="grid">
+<div><label>Timeout Sekunden (5&ndash;120)</label><input id="g_timeout" type="number" min="5" max="120"></div>
+<div><label>Nachlade-Wartezeit ms (0&ndash;10000)</label><input id="g_wait" type="number" min="0" max="10000"></div>
+<div><label>Sprache (locale)</label><input id="g_locale" type="text"></div>
+<div><label>Zeitzone</label><input id="g_tz" type="text"></div>
+<div><label>Viewport Breite</label><input id="g_vw" type="number" min="800" max="3840"></div>
+<div><label>Viewport H&ouml;he</label><input id="g_vh" type="number" min="600" max="2160"></div>
+</div>
+<label>User-Agent</label><input id="g_ua" type="text">
+<label>Proxy (leer = direkt, z.B. http://user:pass@proxy:8080)</label><input id="g_proxy" type="text">
+<label><input id="g_headless" type="checkbox"> Headless (aus = sichtbarer Browser; &Auml;nderung braucht Neustart)</label>
+<label><input id="g_nobilder" type="checkbox"> Bilder blockieren (schneller, sparsamer)</label>
+</div>
+<div class="card"><h3>Cache &amp; Watcher</h3>
+<div class="grid">
+<div><label>Cache TTL Stunden (0 = aus)</label><input id="g_ttl" type="number" min="0" max="720" step="0.5"></div>
+<div><label>Watcher</label><br><label><input id="g_watcher" type="checkbox"> Schn&auml;ppchen-Watcher aktiv</label></div>
+</div></div>
+<div><button id="b_save">Speichern (sofort aktiv)</button></div>
+<p class="mut" id="hint"></p>
+<script>
+const $=id=>document.getElementById(id);
+const tok=localStorage.getItem('sr_token')||'';
+function hdr(){const h={'Content-Type':'application/json'};if(tok)h['X-Token']=tok;return h;}
+function tq(){return tok?{headers:{'X-Token':tok}}:{}}
+async function load(){try{const r=await fetch('/settings/data',tq());const d=await r.json();
+if(!r.ok)throw new Error(d.detail||r.status);
+$('g_port').value=d.port;$('g_token_saved').value=d.server.api_token||'(kein Token gesetzt)';
+$('g_timeout').value=d.scraper.timeout_seconds??30;$('g_wait').value=d.scraper.extra_wait_ms??1500;
+$('g_locale').value=d.scraper.locale||'de-DE';$('g_tz').value=d.scraper.timezone||'Europe/Berlin';
+$('g_vw').value=d.scraper.viewport_width??1366;$('g_vh').value=d.scraper.viewport_height??768;
+$('g_ua').value=d.scraper.user_agent||'';$('g_proxy').value=d.scraper.proxy||'';
+$('g_headless').checked=d.scraper.headless!==false;$('g_nobilder').checked=d.scraper.block_images!==false;
+$('g_ttl').value=d.cache.ttl_hours??6;$('g_watcher').checked=d.watcher.enabled!==false;
+}catch(e){$('msg').innerHTML='<span class="err">Fehler: '+e.message+' (ggf. Token oben auf Start-Seite setzen)</span>';}}
+$('b_save').onclick=async()=>{const b={
+scraper:{timeout_seconds:+$('g_timeout').value,extra_wait_ms:+$('g_wait').value,headless:$('g_headless').checked,
+locale:$('g_locale').value,timezone:$('g_tz').value,viewport_width:+$('g_vw').value,viewport_height:+$('g_vh').value,
+user_agent:$('g_ua').value,block_images:$('g_nobilder').checked,proxy:$('g_proxy').value},
+cache:{ttl_hours:+$('g_ttl').value},watcher:{enabled:$('g_watcher').checked}};
+const nt=$('g_token_new').value;if(nt)b.server={api_token:nt};
+if($('g_tokclear').checked)b.server={api_token:''};
+try{const r=await fetch('/settings/save',{method:'POST',headers:hdr(),body:JSON.stringify(b)});const d=await r.json();
+if(!r.ok)throw new Error(d.detail||r.status);
+$('msg').innerHTML='<span class="ok">Gespeichert: '+d.hinweis+'</span>';
+if(d.restart_needed)$('hint').textContent='Neustart nötig: pct exec <CTID> -- systemctl restart stealth-scraper.service';
+load();}catch(e){$('msg').innerHTML='<span class="err">Fehler: '+e.message+'</span>';}};
+load();
+</script></body></html>"""
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page():
+    return SETTINGS_HTML
 
 
 @app.get("/", response_class=HTMLResponse)

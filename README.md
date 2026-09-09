@@ -55,6 +55,16 @@ curl -X POST http://$IP:8001/watches/thinkpad-10km/run
 Auth (nur wenn `api_token` gesetzt): Header `X-Token: ...` mitsenden.
 Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Research-LXC.
 
+## Weboberfläche (alles einstellbar)
+
+- `/` — Start: Seite prüfen (URL + Selektoren), Targets anlegen/löschen,
+  Schnäppchen-Watches anlegen/löschen/prüfen, Deals + Verlauf ansehen.
+- `/settings` — Einstellungen: API-Token, Scraper (Timeout, Headless,
+  User-Agent, Viewport, Proxy, Bilder blocken), Cache-TTL, Watcher an/aus.
+  Speichern wirkt sofort (nur Headless-Umschaltung braucht einen Neustart:
+  `systemctl restart stealth-scraper.service`).
+- Kein SSH nötig — außer für Updates (Installer erneut laufen lassen).
+
 ## Schnäppchen-Watcher (Kleinanzeigen & Co.)
 
 Prinzip — für **alle Anbieter gleich**:

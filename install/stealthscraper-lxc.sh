@@ -132,9 +132,8 @@ install_inner() {
   IP=$(hostname -I | awk '{print $1}')
   echo ""
   msg_ok "Installation abgeschlossen."
-  echo -e "  ${GN}API:${CL} http://${IP}:8001  |  Health: http://${IP}:8001/health"
-  echo "  Test: curl -X POST http://${IP}:8001/price -H 'Content-Type: application/json' -d '{\"url\":\"https://example.com\"}'"
-  echo "  Targets in config.yaml eintragen, Check: curl -X POST http://${IP}:8001/targets/check"
+  echo -e "  ${GN}Dashboard:${CL} http://${IP}:8001  |  Einstellungen: http://${IP}:8001/settings"
+  echo "  Alles (Scraper, Targets, Watches, Deals) im Browser einstellbar -- kein SSH nötig."
   echo "  Logs: journalctl -u stealth-scraper.service -n 100"
 }
 
