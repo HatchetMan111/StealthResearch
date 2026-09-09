@@ -16,7 +16,7 @@ Brave = Discovery (*welche* Seiten gibt es?), dieser Scraper = Extraktion
 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/StealthResearch/main/install/stealthscraper-lxc.sh)"
 ```
 
-Anpassen: `... -- --ctid 102 --hostname scraper-lxc --memory 4096` (`--help` für alles).
+Anpassen: `... -- --ctid 102 --hostname StealthResearch --memory 4096` (`--help` für alles).
 Update: gleichen Befehl erneut ausführen. Deinstallation: `... -- --uninstall`.
 
 ## API
@@ -53,7 +53,7 @@ Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Rese
 
 ```python
 import requests
-S = "http://scraper-lxc:8001"
+S = "http://StealthResearch:8001"
 for url in brave_urls:  # aus Research-Report
     r = requests.post(f"{S}/price", json={"url": url}, timeout=60).json()
     print(r["preis"], r["verfuegbarkeit"], url)
