@@ -1,0 +1,40 @@
+# Kopieren nach config.yaml -- oder alles leer lassen und nur bei Bedarf anpassen.
+# Kein AI-Zwang: Preise/Verfügbarkeit werden deterministisch per Parser
+# (JSON-LD + Selektoren) extrahiert, kein Ollama nötig.
+# Token kann auch per Umgebungsvariable gesetzt werden: SCRAPER_TOKEN
+
+server:
+  host: "0.0.0.0"
+  port: 8001
+  api_token: ""   # leer = kein Auth (nur Heimnetz!). Sonst Header X-Token: ...
+
+scraper:
+  timeout_seconds: 30
+  headless: true
+  locale: "de-DE"
+  timezone: "Europe/Berlin"
+  viewport_width: 1366
+  viewport_height: 768
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  block_images: true   # true = schneller/sparsamer, false = wenn Bilder für Lazy-Load nötig
+  proxy: ""            # z.B. http://user:pass@proxy:8080 -- leer = direkt
+  # Optionale Standard-Wartezeit nach Load (ms), damit JS-Preise nachladen können
+  extra_wait_ms: 1500
+
+cache:
+  db_path: "data/cache.db"
+  ttl_hours: 6   # 0 = Cache aus
+
+output:
+  results_dir: "data/results"  # JSON-Ablage bei --target all / Timer-Läufen
+
+# Preis-/Verfügbarkeits-Monitoring: beliebig viele Ziele, kein Code nötig.
+# Check via: POST /targets/check  oder  python -m app.main --target all
+targets:
+  - name: "beispiel-shop"
+    enabled: false
+    url: "https://example.com/produkt/123"
+    wait_for: ""        # optional CSS-Selektor, auf den gewartet wird
+    selectors:          # optional eigene Selektoren (überschreiben Auto-Erkennung)
+      preis: ".price"
+      verfuegbarkeit: ".stock"

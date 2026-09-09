@@ -1,0 +1,6 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+PyYAML>=6.0
+playwright>=1.44
+beautifulsoup4>=4.12
+lxml>=5.0

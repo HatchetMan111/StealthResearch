@@ -1,0 +1,8 @@
+[Unit]
+Description=StealthScraper-LXC Target-Check (alle aktiven Targets)
+
+[Service]
+Type=oneshot
+User=scraper
+WorkingDirectory=/opt/stealth-scraper
+ExecStart=/opt/stealth-scraper/venv/bin/python -m app.main --target all --config config.yaml
