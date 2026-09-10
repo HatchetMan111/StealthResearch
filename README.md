@@ -80,7 +80,11 @@ Das System prüft jede Suche automatisch im Intervall, berechnet den **Median**
 und meldet Inserate **X % darunter als Deal** (`UNTER_MARKT`) sowie deutliche
 **Preissenkungen** (`PREISSENKUNG`). Die **Jobs-Tabelle** zeigt pro Suche:
 Intervall, letzter Lauf, **nächster geplanter Lauf**, Ergebnis (Angebote,
-Median, Deals) und Status — mit Aktionen (Jetzt prüfen, Pausieren, Löschen).
+Median, Deals) und Status — mit Aktionen (**Jetzt prüfen**, **Angebote**
+der letzten Prüfung ansehen, **Bearbeiten**, Pausieren, Löschen).
+Bestehende Jobs lassen sich per „Bearbeiten“ ändern (Name bleibt fest),
+ohne sie neu anzulegen. Fehler kommen immer als lesbares JSON
+(statt „Internal Server Error“).
 
 Vorkonfiguriert: `kleinanzeigen`, `mobile`, `autoscout`, `ebay`, `idealo`,
 `generisch` (eigene Selektoren). Neuer Anbieter = 10 Zeilen in

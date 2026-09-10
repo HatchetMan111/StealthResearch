@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_watch
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
-VERSION = "2026.09.10-ui3"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
+VERSION = "2026.09.10-ui4"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
 CACHE = TTLCache(CFG.get("cache", {}).get("db_path", "data/cache.db"),
                  CFG.get("cache", {}).get("ttl_hours", 6))
 SCRAPER = Scraper(CFG)
@@ -43,6 +44,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StealthScraper-LXC", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _json_500(request, exc: Exception):
+    """Jeder Fehler als JSON (kein 'Internal Server Error'-HTML mehr im UI)."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    traceback.print_exc()
+    return JSONResponse({"detail": f"Interner Fehler ({type(exc).__name__}): {exc}"},
+                        status_code=500)
 
 
 def _auth(x_token: str | None) -> None:
@@ -234,10 +245,21 @@ async def watch_run(name: str, x_token: str | None = Header(default=None)):
             "angebote": result.get("angebote_gesamt", 0),
             "deals": len(result.get("deals", [])),
             "median": result.get("median")})
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         WDB.set_state(name, "fehler", str(e))
         raise HTTPException(status_code=502, detail=f"Watch fehlgeschlagen: {e}")
     return JSONResponse(result)
+
+
+@app.get("/watches/{name}/angebote")
+async def watch_angebote(name: str, limit: int = 100,
+                         x_token: str | None = Header(default=None)):
+    """Zuletzt gefundene Angebote dieser Watch (Snapshot vom letzten Lauf)."""
+    _auth(x_token)
+    return JSONResponse(WDB.get_snapshot(name, limit))
 
 
 @app.get("/deals")
@@ -266,7 +288,10 @@ async def watch_preview(req: PreviewReq, x_token: str | None = Header(default=No
         mp = None
     try:
         return JSONResponse(await preview_search(SCRAPER, url, req.provider or "auto", mp))
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Vorschau fehlgeschlagen: {e}")
 
 
@@ -533,12 +558,13 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <textarea id="w_sel" rows="2" placeholder="preis=.mein-preis"></textarea>
 </details>
 <label><input id="w_enabled" type="checkbox" checked> Aktiviert (pausiert = kein automatischer Lauf)</label>
-<div><button id="b_wsave">Watch speichern &amp; einplanen</button></div>
+<div><button id="b_wsave">Watch speichern &amp; einplanen</button>
+<button id="b_wcancel" class="sec" style="display:none">Abbrechen</button></div>
 </details>
 <h3>Geplante &amp; gelaufene Jobs</h3>
 <div><button id="b_watches" class="sec">Aktualisieren</button>
 <button id="b_deals" class="sec">Deals laden</button></div>
-<div id="watches"></div>
+<div id="watches"></div><div id="ang"></div>
 <h3>Gefundene Deals <select id="deal_filter" style="width:auto"><option value="">alle Watches</option></select></h3>
 <div id="deals"></div></div>
 
@@ -571,8 +597,7 @@ $('res').innerHTML=h;}
 async function call(path,body){
 const u=$('url').value.trim();if(!u&&body.url!==undefined&&!body.url){$('res').innerHTML='<span class="err">Bitte URL eingeben.</span>';return;}
 busy(true);$('res').innerHTML='<span class="mut">L&auml;dt &hellip;</span>';
-try{const r=await fetch(path,{method:'POST',headers:hdr(),body:JSON.stringify(body)});
-const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);render(d);}
+try{render(await apiJSON(path,{method:'POST',headers:hdr(),body:JSON.stringify(body)}));}
 catch(e){$('res').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}busy(false);}
 $('b_price').onclick=()=>call('/price',{url:$('url').value.trim(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
 $('b_scrape').onclick=()=>call('/scrape',{url:$('url').value.trim(),selectors:buildSel(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
@@ -610,18 +635,20 @@ $('w_query').oninput=e=>{if(!$('w_name').value.trim())$('w_name').value=slug(e.t
 function pillInit(id,hidden){const box=$(id);if(!box)return;box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');if(hidden&&$(hidden))$(hidden).value=b.dataset.v;};});}
 pillInit('r_pills');pillInit('i_pills','w_interval');
 $('w_schwelle_r').oninput=e=>{$('schw_val').textContent=e.target.value;};
-function toast(m,err){const t=$('toast');t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',5000);}
+function toast(m,err){const t=$('toast');t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',6000);}
+async function apiJSON(path,opts){const r=await fetch(path,opts);const t=await r.text();
+let d;try{d=t?JSON.parse(t):{}}catch(e){throw new Error(t.slice(0,160)||('HTTP '+r.status));}
+if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));return d;}
 function radiusVal(){const b=document.querySelector('#r_pills .pill.on');return b?parseInt(b.dataset.v):10;}
 $('b_quick').onclick=async()=>{const q=$('w_query').value.trim();if(!q){toast('Erst Suchbegriff eingeben',1);return;}
-try{const r=await fetch('/watches/quicklink',{method:'POST',headers:hdr(),body:JSON.stringify({provider:$('w_provider').value,query:q})});
-const d=await r.json();if(!d.url){toast('Für diesen Anbieter: Suche manuell öffnen (komplexe Filter)',1);return;}
+try{const d=await apiJSON('/watches/quicklink',{method:'POST',headers:hdr(),body:JSON.stringify({provider:$('w_provider').value,query:q})});
+if(!d.url){toast('Für diesen Anbieter: Suche manuell öffnen (komplexe Filter)',1);return;}
 window.open(d.url,'_blank');toast('Suche geöffnet: dort PLZ + Umkreis + Preis wählen, URL kopieren');}catch(e){toast('Fehler: '+e.message,1);}};
 $('b_preview').onclick=async()=>{const u=$('w_url').value.trim();if(!u){toast('Erst Such-URL einfügen',1);return;}
 $('preview').innerHTML='<span class="mut">Teste URL &hellip; (dauert ca. 10&ndash;20 s)</span>';
 try{const mp=$('w_maxpreis').value.trim();
 const body={search_url:u,provider:$('w_provider').value};if(mp)body.max_preis=parseFloat(mp);
-const r=await fetch('/watches/preview',{method:'POST',headers:hdr(),body:JSON.stringify(body)});
-const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
+const d=await apiJSON('/watches/preview',{method:'POST',headers:hdr(),body:JSON.stringify(body)});
 let h='<p>'+d.angebote_gesamt+' Treffer, '+d.mit_preis+' mit Preis, Median <b>'+(d.median??'&ndash;')+' &euro;</b> <span class="mut">('+esc(d.provider_erkannt)+')</span></p>';
 if(d.beispiele&&d.beispiele.length){h+='<table><tr><th>Beispiel</th><th>Preis</th></tr>';
 d.beispiele.forEach(b=>{h+='<tr><td>'+esc(b.titel||b.url)+'</td><td>'+(b.preis??'&ndash;')+' &euro;</td></tr>';});h+='</table>';}
@@ -634,9 +661,26 @@ const b={name:v('w_name')||slug(v('w_query'))||('watch-'+Date.now().toString(36)
 query:v('w_query'),plz:v('w_plz'),radius_km:radiusVal(),
 deal_schwelle_prozent:parseInt($('w_schwelle_r').value)||25,interval_minutes:parseInt($('w_interval').value)||60,
 notify_webhook:v('w_hook'),selectors:sel};const mp=v('w_maxpreis');if(mp)b.max_preis=parseFloat(mp);return b;}
-$('b_wsave').onclick=async()=>{const b=wBody();if(!b.name||!b.search_url){toast('Name und Such-URL ausfüllen',1);return;}
-try{const r=await fetch('/watches',{method:'POST',headers:hdr(),body:JSON.stringify(b)});const d=await r.json();
-if(!r.ok)throw new Error(d.detail||r.status);toast('Gespeichert: '+d.name+' (alle '+d.interval_minutes+' Min)');loadWatches();}catch(e){toast('Fehler: '+e.message,1);}};
+let EDIT=null;
+function setPills(id,val){document.querySelectorAll('#'+id+' .pill').forEach(b=>b.classList.toggle('on',b.dataset.v==String(val)));}
+$('b_wsave').onclick=async()=>{const b=wBody();if(!b.search_url){toast('Such-URL einfügen',1);return;}
+try{let d;
+if(EDIT){d=await apiJSON('/watches/'+encodeURIComponent(EDIT),{method:'PUT',headers:hdr(),body:JSON.stringify(b)});cancelEdit();toast('Gespeichert: '+d.name);}
+else{d=await apiJSON('/watches',{method:'POST',headers:hdr(),body:JSON.stringify(b)});toast('Eingeplant: '+d.name+' (alle '+d.interval_minutes+' Min)');}
+loadWatches();}catch(e){toast('Fehler: '+e.message+(EDIT?'':' (Tipp: erst „URL testen“)'),1);}};
+$('b_wcancel').onclick=cancelEdit;
+function cancelEdit(){EDIT=null;$('w_name').disabled=false;$('b_wsave').textContent='Watch speichern & einplanen';$('b_wcancel').style.display='none';}
+async function editWatch(n){try{const d=await apiJSON('/watches',tokQ());const w=d.find(x=>x.name===n);if(!w){toast('Watch nicht gefunden',1);return;}
+EDIT=n;$('w_provider').value=w.provider||'auto';updPhinweis();
+$('w_query').value=w.query||'';$('w_url').value=w.search_url||'';$('w_name').value=w.name;$('w_name').disabled=true;
+$('w_plz').value=w.plz||'';$('w_maxpreis').value=w.max_preis??'';
+setPills('r_pills',w.radius_km||10);setPills('i_pills',w.interval_minutes||60);$('w_interval').value=w.interval_minutes||60;
+$('w_schwelle_r').value=w.deal_schwelle_prozent||25;$('schw_val').textContent=w.deal_schwelle_prozent||25;
+$('w_hook').value=w.notify_webhook||'';$('w_enabled').checked=w.enabled!==false;
+const sel=w.selectors||{};$('w_sel').value=Object.keys(sel).map(k=>k+'='+sel[k]).join('\\n');
+$('b_wsave').textContent='Änderungen speichern';$('b_wcancel').style.display='';
+toast('Bearbeite '+n+' (Name fest, Rest änderbar)');window.scrollTo({top:0,behavior:'smooth'});
+}catch(e){toast('Fehler: '+e.message,1);}}
 function fmtT(ts){return ts?new Date(ts*1000).toLocaleString('de-DE'):'nie';}
 function fmtIn(ts){if(!ts)return'&ndash;';const s=ts-Math.floor(Date.now()/1000);if(s<=0)return'<b>f&auml;llig</b>';if(s<3600)return'in '+Math.ceil(s/60)+' Min';if(s<86400)return'in '+(s/3600).toFixed(1)+' Std';return'in '+Math.round(s/86400)+' Tg';}
 async function loadWatches(){try{const r=await fetch('/watches',tokQ());const d=await r.json();
@@ -650,6 +694,8 @@ h+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)
 +'<td>alle '+w.interval_minutes+' Min</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
 +'<td>'+erg+'</td><td>'+(w.last_status==='ok'?'<span class="ok">ok</span>':w.last_status==='nie'?'<span class="mut">wartet</span>':'<span class="err">'+esc(w.last_status)+'</span>')+(w.last_error?'<br><span class="mut">'+esc(w.last_error.slice(0,80))+'</span>':'')+'</td>'
 +'<td><button class="sec" onclick="runWatch(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
++'<button class="sec" onclick="showAngebote(\\''+esc(w.name)+'\\')">Angebote</button> '
++'<button class="sec" onclick="editWatch(\\''+esc(w.name)+'\\')">Bearbeiten</button><br>'
 +'<button class="sec" onclick="toggleWatch(\\''+esc(w.name)+'\\','+(w.enabled?'0':'1')+')">'+(w.enabled?'Pausieren':'Aktivieren')+'</button> '
 +'<button class="warn" onclick="delWatch(\\''+esc(w.name)+'\\')">L&ouml;schen</button></td></tr>';});
 h+='</table>';$('watches').innerHTML=h;}catch(e){$('watches').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
@@ -658,10 +704,15 @@ async function toggleWatch(n,en){try{const r=await fetch('/watches',tokQ());cons
 const w=d.find(x=>x.name===n);if(!w)return;w.enabled=!!en;
 const p=await fetch('/watches/'+encodeURIComponent(n),{method:'PUT',headers:hdr(),body:JSON.stringify(w)});
 if(!p.ok){const e=await p.json();throw new Error(e.detail||p.status);}loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
-async function runWatch(n){toast('Prüfe '+n+' …');
-try{const r=await fetch('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
-const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
-toast(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();}catch(e){toast('Fehler: '+e.message,1);}}
+async function runWatch(n){toast('Prüfe '+n+' … (dauert ca. 30–60 s)');
+try{const d=await apiJSON('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
+toast(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();showAngebote(n,true);}catch(e){toast('Fehler: '+e.message,1);loadWatches();}}
+async function showAngebote(n,silent){try{const d=await apiJSON('/watches/'+encodeURIComponent(n)+'/angebote?limit=100',tokQ());
+if(!d.length){if(!silent)$('ang').innerHTML='<p class="mut">Keine Angebote gespeichert &mdash; erst „Jetzt prüfen“.</p>';return;}
+let h='<h3>Zuletzt gefundene Angebote: '+esc(n)+' ('+d.length+')</h3><table><tr><th>Angebot</th><th>Preis</th><th>Ort</th></tr>';
+d.forEach(a=>{h+='<tr><td><a target="_blank" href="'+esc(a.url)+'">'+esc(a.titel||a.url)+'</a></td>'
++'<td>'+(a.preis??esc(a.preis_text||'&ndash;'))+' &euro;</td><td>'+esc(a.ort||'&ndash;')+'</td></tr>';});
+h+='</table>';$('ang').innerHTML=h;}catch(e){if(!silent)toast('Fehler: '+e.message,1);}}
 async function delWatch(n){if(!confirm('Watch \\''+n+'\\' löschen?'))return;
 try{await fetch('/watches/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
 async function loadDeals(){const wf=$('deal_filter').value;const q=wf?'?watch='+encodeURIComponent(wf)+'&limit=50':'?limit=50';

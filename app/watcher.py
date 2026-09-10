@@ -123,6 +123,10 @@ class WatchDB:
         self._db.execute("""CREATE TABLE IF NOT EXISTS deals
             (id INTEGER PRIMARY KEY AUTOINCREMENT, watch TEXT, listing_url TEXT,
              titel TEXT, preis REAL, median REAL, rabatt REAL, grund TEXT, zeit INTEGER)""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS watch_listings
+            (watch TEXT, ext_id TEXT, titel TEXT, preis REAL, preis_text TEXT,
+             url TEXT, ort TEXT, zeit INTEGER,
+             PRIMARY KEY (watch, ext_id))""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS watch_state
             (name TEXT PRIMARY KEY, last_run INTEGER, last_status TEXT, last_error TEXT)""")
         # Migration für ältere DBs (Jobs-Tabelle: letzter Lauf im Detail)
@@ -176,6 +180,26 @@ class WatchDB:
         args.append(limit)
         return [dict(zip(("watch", "url", "titel", "preis", "median", "rabatt", "grund", "zeit"),
                          r)) for r in self._db.execute(q, args).fetchall()]
+
+    # -- snapshot: zuletzt gefundene angebote je watch (für "angebote ansehen") --
+    def save_snapshot(self, watch: str, listings: list[dict], limit: int = 150) -> None:
+        now = int(time.time())
+        self._db.execute("DELETE FROM watch_listings WHERE watch=?", (watch,))
+        for ad in listings[:limit]:
+            self._db.execute(
+                "INSERT OR REPLACE INTO watch_listings"
+                " (watch, ext_id, titel, preis, preis_text, url, ort, zeit)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (watch, ad.get("ext_id", ""), (ad.get("titel") or "")[:200], ad.get("preis"),
+                 (ad.get("preis_text") or "")[:60], ad.get("url", ""), (ad.get("ort") or "")[:120], now))
+        self._db.commit()
+
+    def get_snapshot(self, watch: str, limit: int = 100) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT titel, preis, preis_text, url, ort, zeit FROM watch_listings"
+            " WHERE watch=? ORDER BY preis IS NULL, preis LIMIT ?",
+            (watch, max(1, min(limit, 200)))).fetchall()
+        return [dict(zip(("titel", "preis", "preis_text", "url", "ort", "zeit"), r)) for r in rows]
 
     # -- state --
     def last_run(self, name: str) -> int:
@@ -289,6 +313,7 @@ async def run_watch(scraper, watch: dict, db: WatchDB) -> dict:
     for ad in angebote:
         db.upsert(provider_key, ad, now)
     db.commit()
+    db.save_snapshot(name, angebote)
 
     if deals and watch.get("notify_webhook"):
         try:

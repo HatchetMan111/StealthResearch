@@ -82,6 +82,17 @@ def run():
                                                   enabled=False), x_token=None)
         wl2 = await s.watches_list(x_token=None)
         assert j(wl2)[0]["next_run"] is None and j(wl2)[0]["enabled"] is False
+        # 8b. bearbeiten (PUT): intervall + query aendern
+        up = await s.watch_update("thinkpad", WatchReq(name="thinkpad", search_url="https://www.kleinanzeigen.de/s-laptop/x",
+                                                       query="ThinkPad X", interval_minutes=120,
+                                                       enabled=True), x_token=None)
+        assert j(up)["query"] == "ThinkPad X" and j(up)["interval_minutes"] == 120, j(up)
+        # 8c. angebote-snapshot vom lauf
+        ang = await s.watch_angebote("thinkpad", limit=100, x_token=None)
+        assert len(j(ang)) == 6 and j(ang)[0]["url"].startswith("https://"), j(ang)
+        # 8d. 500er kommen als JSON (kein HTML)
+        err = await s._json_500(None, ValueError("boom"))
+        assert err.status_code == 500 and "boom" in j(err)["detail"], j(err)
         # 9. settings roundtrip
         sd = await s.settings_data(x_token=None)
         assert "scraper" in j(sd) and "watcher" in j(sd)
