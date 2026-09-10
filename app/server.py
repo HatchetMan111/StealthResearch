@@ -22,7 +22,7 @@ from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_watch
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
-VERSION = "2026.09.10-ui4"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
+VERSION = "2026.09.10-ui5"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
 CACHE = TTLCache(CFG.get("cache", {}).get("db_path", "data/cache.db"),
                  CFG.get("cache", {}).get("ttl_hours", 6))
 SCRAPER = Scraper(CFG)
@@ -829,27 +829,38 @@ async def index():
 async def _fetch_cached(url: str, wait_for: str, extra: str, fresh: bool) -> dict:
     if not fresh:
         hit = CACHE.get(url, extra)
-        if hit:
+        # Nur echte Seiten-Treffer verwenden (alte Cache-Einträge ohne html/title ignorieren)
+        if hit and isinstance(hit, dict) and "html" in hit and "title" in hit:
             hit["cached"] = True
             return hit
     page = await SCRAPER.fetch(url, wait_for=wait_for)
     return {**page, "cached": False}
 
 
+def _store_page(url: str, extra: str, page: dict, fresh: bool) -> None:
+    """Ganze Seite cachen (mit html/title) statt abgeleiteter Daten."""
+    if not fresh:
+        CACHE.set(url, extra, {"url": page.get("url", url), "html": page.get("html", ""),
+                               "title": page.get("title", ""), "status": page.get("status", 0)})
+
+
 @app.post("/scrape")
 async def scrape(req: ScrapeReq, x_token: str | None = Header(default=None)):
     _auth(x_token)
+    cache_key = str(sorted(req.selectors.items()))
     try:
-        page = await _fetch_cached(req.url, req.wait_for, str(sorted(req.selectors.items())), req.fresh)
+        page = await _fetch_cached(req.url, req.wait_for, cache_key, req.fresh)
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Scrape fehlgeschlagen: {e}")
     data = {"url": req.url, "titel": page["title"], "status": page["status"], "cached": page["cached"]}
     if req.selectors:
         data["felder"] = extract_with_selectors(page["html"], req.selectors)
     else:
         data["auto"] = auto_price(page["html"])
-    if not req.fresh:
-        CACHE.set(req.url, str(sorted(req.selectors.items())), {k: v for k, v in data.items() if k != "cached"})
+    _store_page(req.url, cache_key, page, req.fresh)
     return JSONResponse(data)
 
 
@@ -858,12 +869,14 @@ async def price(req: PriceReq, x_token: str | None = Header(default=None)):
     _auth(x_token)
     try:
         page = await _fetch_cached(req.url, req.wait_for, "price", req.fresh)
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Scrape fehlgeschlagen: {e}")
     result = {"url": req.url, "titel": page["title"], "status": page["status"],
               "cached": page["cached"], **auto_price(page["html"])}
-    if not req.fresh:
-        CACHE.set(req.url, "price", {k: v for k, v in result.items() if k != "cached"})
+    _store_page(req.url, "price", page, req.fresh)
     return JSONResponse(result)
 
 

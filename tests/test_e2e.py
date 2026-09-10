@@ -39,6 +39,8 @@ def run():
     s.CONFIG_PATH = cfg_path
     s.WDB = WatchDB(str(tmp / "deals.db"))
     s.SCRAPER = StubScraper()
+    from app.cache import TTLCache
+    s.CACHE = TTLCache(":memory:", 6)
 
     def j(resp):
         return resp if isinstance(resp, dict) else json.loads(resp.body)
@@ -112,6 +114,20 @@ def run():
         # 11. watch löschen
         await s.watch_delete("thinkpad", x_token=None)
         assert j(await s.watches_list(x_token=None)) == []
+        # 12. Regression: 2x derselbe Scrape (2. aus Cache) -> kein KeyError 'title'
+        from app.server import ScrapeReq
+        r1 = await s.scrape(ScrapeReq(url="https://shop.example/p/1",
+                                      selectors={"preis": ".aditem-main--middle--price-shipping--price"}),
+                            x_token=None)
+        assert j(r1)["cached"] is False and "felder" in j(r1), j(r1)
+        r2 = await s.scrape(ScrapeReq(url="https://shop.example/p/1",
+                                      selectors={"preis": ".aditem-main--middle--price-shipping--price"}),
+                            x_token=None)
+        assert j(r2)["cached"] is True and j(r2)["felder"]["preis"] != "", j(r2)
+        # 13. alter Cache-Eintrag (ohne html/title) wird ignoriert statt zu crashen
+        s.CACHE.set("https://shop.example/alt", "[]", {"url": "x", "titel": "Alt"})
+        r3 = await s.scrape(ScrapeReq(url="https://shop.example/alt"), x_token=None)
+        assert j(r3)["cached"] is False, j(r3)
         print("E2E_OK")
 
     asyncio.run(flow())
