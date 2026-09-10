@@ -111,6 +111,32 @@ def run():
         tl = await s.targets_list(x_token=None)
         assert len(j(tl)) == 1
         await s.target_delete("t1", x_token=None)
+        # 10b. target mit cron-intervall: jobs-tabelle + scheduler + verlauf
+        await s.target_create(TargetReq(name="cronjob", url="https://shop.example/1",
+                                        interval_minutes=30), x_token=None)
+        jb = await s.jobs_list(x_token=None)
+        tj = [x for x in j(jb)["targets"] if x["name"] == "cronjob"][0]
+        assert tj["intervall"] == "alle 30 Min" and tj["next_run"] is not None, tj
+        from app.scheduler import due_targets
+        assert due_targets({"targets": [{"name": "cronjob", "url": "https://shop.example/1",
+                                          "interval_minutes": 30, "enabled": True}]}, s.WDB) != []
+        tr = await s.target_run("cronjob", x_token=None)
+        assert j(tr)["ok"] is True and j(tr)["preis"] == "350.00", j(tr)
+        runs = await s.target_runs("cronjob", limit=5, x_token=None)
+        assert len(j(runs)) == 1 and j(runs)[0]["ok"] is True, j(runs)
+        await s.target_delete("cronjob", x_token=None)
+        # 10c. watch-unterseite mit snapshot
+        await s.watch_create(WatchReq(name="w2", search_url="https://www.kleinanzeigen.de/s-laptop/x"),
+                             x_token=None)
+        await s.watch_run("w2", x_token=None)
+        page = await s.watch_page("w2")
+        assert "ThinkPad" in page and "/jobs" in page, page[:200]
+        await s.watch_delete("w2", x_token=None)
+        try:
+            await s.watch_page("weg")
+            raise SystemExit("404 fehlt!")
+        except Exception as e:
+            assert getattr(e, "status_code", None) == 404, e
         # 11. watch löschen
         await s.watch_delete("thinkpad", x_token=None)
         assert j(await s.watches_list(x_token=None)) == []

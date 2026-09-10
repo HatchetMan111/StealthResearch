@@ -29,12 +29,13 @@ output:
   results_dir: "data/results"  # JSON-Ablage bei --target all / Timer-Läufen
 
 # Preis-/Verfügbarkeits-Monitoring: beliebig viele Ziele, kein Code nötig.
-# Check via: POST /targets/check  oder  python -m app.main --target all
+# Check via Dashboard (/jobs), POST /targets/check oder python -m app.main --target all
 targets:
   - name: "beispiel-shop"
     enabled: false
     url: "https://example.com/produkt/123"
     wait_for: ""        # optional CSS-Selektor, auf den gewartet wird
+    interval_minutes: 0 # 0 = nur manuell (sonst Cron-Abstand, min. 15)
     selectors:          # optional eigene Selektoren (überschreiben Auto-Erkennung)
       preis: ".price"
       verfuegbarkeit: ".stock"

@@ -57,8 +57,16 @@ Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Rese
 
 ## Weboberfläche (alles einstellbar)
 
-- `/` — Start: Seite prüfen (URL + Selektoren), Targets anlegen/löschen,
-  Schnäppchen-Watches anlegen/löschen/prüfen, Deals + Verlauf ansehen.
+- `/` — **Watcher**: Assistent (Anbieter → Suche öffnen → URL testen → Abstand wählen),
+  Jobs-Tabelle, Deals.
+- `/scrape` — **Seite prüfen**: URL + optionale CSS-Selektoren (jedes Feld hat ein
+  `?` mit Erklärung + Anleitung zum Finden von Selektoren), Ergebnis mit
+  **Preis-Kandidaten** (alle Quellen transparent), „Als Job speichern“ mit
+  eigenem Prüf-Abstand.
+- `/jobs` — **Alle Jobs**: Watches + Targets mit Intervall, letztem/nächstem Lauf,
+  Ergebnis, Verlauf (Targets) und Angebots-Unterseite (Watches).
+- `/watch/{name}` — **Angebots-Unterseite**: alle Treffer des letzten Laufs,
+  auch ohne Deal, zum Nachprüfen.
 - `/settings` — Einstellungen: API-Token, Scraper (Timeout, Headless,
   User-Agent, Viewport, Proxy, Bilder blocken), Cache-TTL, Watcher an/aus.
   Speichern wirkt sofort (nur Headless-Umschaltung braucht einen Neustart:

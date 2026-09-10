@@ -18,7 +18,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from .parser import parse_preis
+from .parser import auto_price, extract_with_selectors, parse_preis
 from .providers import preset_for_url, select_first
 
 MIN_INTERVAL_MINUTES = 15  # Höflichkeits-Limit gegen Bot-Schutz (kleinanzeigen.de bannt schnell)
@@ -127,6 +127,9 @@ class WatchDB:
             (watch TEXT, ext_id TEXT, titel TEXT, preis REAL, preis_text TEXT,
              url TEXT, ort TEXT, zeit INTEGER,
              PRIMARY KEY (watch, ext_id))""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS target_runs
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, zeit INTEGER,
+             ok INTEGER, titel TEXT, preis TEXT, status INTEGER, fehler TEXT, daten TEXT)""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS watch_state
             (name TEXT PRIMARY KEY, last_run INTEGER, last_status TEXT, last_error TEXT)""")
         # Migration für ältere DBs (Jobs-Tabelle: letzter Lauf im Detail)
@@ -200,6 +203,38 @@ class WatchDB:
             " WHERE watch=? ORDER BY preis IS NULL, preis LIMIT ?",
             (watch, max(1, min(limit, 200)))).fetchall()
         return [dict(zip(("titel", "preis", "preis_text", "url", "ort", "zeit"), r)) for r in rows]
+
+    # -- target-runs: verlauf wiederkehrender seite-prüfen-jobs --
+    def add_target_run(self, name: str, result: dict, keep: int = 50) -> None:
+        self._db.execute(
+            "INSERT INTO target_runs (name, zeit, ok, titel, preis, status, fehler, daten)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, int(result.get("zeit", time.time())), 1 if result.get("ok") else 0,
+             (result.get("titel") or "")[:200], str(result.get("preis") or "")[:40],
+             int(result.get("status") or 0), (result.get("fehler") or "")[:500],
+             json.dumps(result, ensure_ascii=False)[:8000]))
+        self._db.execute(
+            "DELETE FROM target_runs WHERE name=? AND id NOT IN"
+            " (SELECT id FROM target_runs WHERE name=? ORDER BY zeit DESC LIMIT ?)",
+            (name, name, keep))
+        self._db.commit()
+
+    def last_target_run(self, name: str) -> dict | None:
+        row = self._db.execute(
+            "SELECT zeit, ok, titel, preis, status, fehler FROM target_runs"
+            " WHERE name=? ORDER BY zeit DESC LIMIT 1", (name,)).fetchone()
+        if not row:
+            return None
+        return {"zeit": row[0], "ok": bool(row[1]), "titel": row[2] or "",
+                "preis": row[3] or "", "status": row[4] or 0, "fehler": row[5] or ""}
+
+    def target_runs(self, name: str, limit: int = 20) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT zeit, ok, titel, preis, status, fehler FROM target_runs"
+            " WHERE name=? ORDER BY zeit DESC LIMIT ?",
+            (name, max(1, min(limit, 100)))).fetchall()
+        return [{"zeit": r[0], "ok": bool(r[1]), "titel": r[2] or "", "preis": r[3] or "",
+                 "status": r[4] or 0, "fehler": r[5] or ""} for r in rows]
 
     # -- state --
     def last_run(self, name: str) -> int:
@@ -324,3 +359,23 @@ async def run_watch(scraper, watch: dict, db: WatchDB) -> dict:
             "mit_preis": len([a for a in angebote if a.get("preis") is not None]),
             "median": round(median, 2) if median else None,
             "schwelle_prozent": schwelle, "deals": deals}
+
+
+async def run_target(scraper, target: dict, db: WatchDB) -> dict:
+    """Ein wiederkehrender Seite-prüfen-Job: Seite holen, auswerten, Verlauf speichern."""
+    name = target.get("name", "?")
+    try:
+        page = await scraper.fetch(target["url"], wait_for=target.get("wait_for", ""))
+        info = auto_price(page["html"])
+        if target.get("selectors"):
+            info["felder"] = extract_with_selectors(page["html"], target["selectors"])
+        result = {"name": name, "ok": True, "titel": info.get("name", ""),
+                  "preis": info.get("preis", ""), "verfuegbarkeit": info.get("verfuegbarkeit", ""),
+                  "quelle": info.get("quelle", ""), "kandidaten": info.get("kandidaten", []),
+                  "felder": info.get("felder", {}), "status": page.get("status", 0),
+                  "zeit": int(time.time())}
+    except Exception as e:
+        result = {"name": name, "ok": False, "fehler": str(e)[:500],
+                  "titel": "", "preis": "", "status": 0, "zeit": int(time.time())}
+    db.add_target_run(name, result)
+    return result

@@ -9,7 +9,30 @@ import asyncio
 import time
 
 from .config import load_config, resolve_config_path
-from .watcher import MIN_INTERVAL_MINUTES, WatchDB, run_watch
+from .watcher import MIN_INTERVAL_MINUTES, WatchDB, run_target, run_watch
+
+
+def target_interval(target: dict) -> int:
+    """0 = nur manuell (kein Cron), sonst Minuten (min. 15)."""
+    iv = int(target.get("interval_minutes", 0) or 0)
+    if iv <= 0:
+        return 0
+    return max(iv, MIN_INTERVAL_MINUTES) * 60
+
+
+def due_targets(cfg: dict, db: WatchDB, now: int | None = None) -> list[dict]:
+    now = now if now is not None else int(time.time())
+    due = []
+    for t in cfg.get("targets", []) or []:
+        if not t.get("enabled", True) or not t.get("url"):
+            continue
+        iv = target_interval(t)
+        if not iv:
+            continue
+        last = db.last_target_run(t.get("name", ""))
+        if now - (last["zeit"] if last else 0) >= iv:
+            due.append(t)
+    return due
 
 
 def interval_seconds(watch: dict) -> int:
@@ -53,6 +76,13 @@ async def scheduler_loop(scraper_getter, db: WatchDB, stop_event: asyncio.Event)
                             "median": result.get("median")})
                     except Exception as e:  # Watch darf Scheduler nie killen
                         db.set_state(name, "fehler", str(e))
+                for t in due_targets(cfg, db):
+                    if stop_event.is_set():
+                        break
+                    try:
+                        await run_target(scraper_getter(), t, db)
+                    except Exception:
+                        pass  # Fehler steht im target_runs-Verlauf
         except Exception:
             pass
         try:

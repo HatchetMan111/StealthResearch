@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import time
 import traceback
@@ -16,9 +17,9 @@ from .cache import TTLCache
 from .config import load_config, resolve_config_path, save_config
 from .parser import auto_price, extract_with_selectors
 from .providers import PROVIDERS, preset_for_url, quick_search_url
-from .scheduler import due_watches, next_run_ts, scheduler_loop
+from .scheduler import due_watches, next_run_ts, scheduler_loop, target_interval
 from .scraper import Scraper
-from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_watch
+from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_target, run_watch
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
@@ -403,25 +404,51 @@ class TargetReq(BaseModel):
     url: str = ""
     wait_for: str = ""
     selectors: dict[str, str] = Field(default_factory=dict)
+    interval_minutes: int = 0  # 0 = nur manuell/täglicher Timer, sonst Cron-Abstand
+    enabled: bool = True
+
+
+def _clean_target(data: dict) -> dict:
+    name, url = (data.get("name") or "").strip(), (data.get("url") or "").strip()
+    if not name or len(name) > 60:
+        raise HTTPException(status_code=400, detail="Name fehlt/ungültig")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL muss mit http(s):// beginnen")
+    iv = int(data.get("interval_minutes", 0) or 0)
+    if 0 < iv < MIN_INTERVAL_MINUTES:
+        iv = MIN_INTERVAL_MINUTES
+    return {"name": name, "url": url, "wait_for": (data.get("wait_for") or "").strip(),
+            "selectors": dict(data.get("selectors") or {}),
+            "interval_minutes": iv, "enabled": bool(data.get("enabled", True))}
 
 
 @app.post("/targets")
 async def target_create(req: TargetReq, x_token: str | None = Header(default=None)):
     _auth(x_token)
-    name, url = req.name.strip(), req.url.strip()
-    if not name or len(name) > 60:
-        raise HTTPException(status_code=400, detail="Name fehlt/ungültig")
-    if not (url.startswith("http://") or url.startswith("https://")):
-        raise HTTPException(status_code=400, detail="URL muss mit http(s):// beginnen")
     cfg = _fresh_cfg()
     targets = cfg.get("targets", []) or []
-    if any(t.get("name") == name for t in targets):
+    clean = _clean_target(req.model_dump())
+    if any(t.get("name") == clean["name"] for t in targets):
         raise HTTPException(status_code=409, detail="Target existiert bereits")
-    targets.append({"name": name, "url": url, "wait_for": req.wait_for.strip(),
-                    "selectors": dict(req.selectors or {})})
+    targets.append(clean)
     cfg["targets"] = targets
     save_config(cfg, CONFIG_PATH)
-    return {"ok": True}
+    return JSONResponse(clean)
+
+
+@app.put("/targets/{name}")
+async def target_update(name: str, req: TargetReq, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    cfg = _fresh_cfg()
+    targets = cfg.get("targets", []) or []
+    idx = next((i for i, t in enumerate(targets) if t.get("name") == name), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="Target nicht gefunden")
+    clean = _clean_target({**req.model_dump(), "name": name})
+    targets[idx] = clean
+    cfg["targets"] = targets
+    save_config(cfg, CONFIG_PATH)
+    return JSONResponse(clean)
 
 
 @app.delete("/targets/{name}")
@@ -433,17 +460,77 @@ async def target_delete(name: str, x_token: str | None = Header(default=None)):
     return {"ok": True}
 
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>StealthScraper-LXC</title>
-<style>
-:root{--bg:#0f1115;--card:#1a1e26;--line:#2c3340;--txt:#e8ecf1;--mut:#9aa4b2;--acc:#4caf7d;--acc-d:#1b5e20;--warn:#8a6d00;--err:#ff8a8a}
+@app.post("/targets/{name}/run")
+async def target_run(name: str, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    cfg = _fresh_cfg()
+    target = next((t for t in (cfg.get("targets", []) or []) if t.get("name") == name), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Target nicht gefunden")
+    try:
+        return JSONResponse(await run_target(SCRAPER, target, WDB))
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Target fehlgeschlagen: {e}")
+
+
+@app.get("/targets/{name}/runs")
+async def target_runs(name: str, limit: int = 20,
+                      x_token: str | None = Header(default=None)):
+    """Verlauf eines Seite-prüfen-Jobs (für Nachprüfung)."""
+    _auth(x_token)
+    return JSONResponse(WDB.target_runs(name, limit))
+
+
+@app.get("/jobs")
+async def jobs_list(x_token: str | None = Header(default=None)):
+    """Alle Jobs einheitlich: Watches + Targets mit Intervall, Läufen, Ergebnis."""
+    _auth(x_token)
+    cfg = _fresh_cfg()
+    now = int(time.time())
+    watches = []
+    for w in cfg.get("watches", []) or []:
+        st = WDB.get_state(w.get("name", ""))
+        watches.append({
+            "typ": "watch", "name": w.get("name"), "enabled": bool(w.get("enabled")),
+            "intervall": f"alle {w.get('interval_minutes', 60)} Min",
+            "last_run": st["last_run"], "next_run": next_run_ts(w, st["last_run"], now),
+            "ergebnis": (f"{st['last_angebote']} Angebote · Median {st['last_median']} € · "
+                         f"{st['last_deals']} Deals" if st["last_run"] else "noch nie gelaufen"),
+            "status": st["last_status"], "fehler": st["last_error"],
+        })
+    targets = []
+    for t in cfg.get("targets", []) or []:
+        last = WDB.last_target_run(t.get("name", ""))
+        iv = target_interval(t)
+        nxt = (last["zeit"] + iv) if (last and iv) else (now if (iv and t.get("enabled", True)) else None)
+        if nxt is not None and nxt <= now and t.get("enabled", True):
+            nxt = now  # fällig
+        erg = "noch nie gelaufen"
+        if last:
+            erg = (f"{'ok' if last['ok'] else 'fehler'} · {last['titel'][:50]} · "
+                   f"{last['preis']} €" if last["preis"] else f"{'ok' if last['ok'] else 'fehler'}")
+        targets.append({
+            "typ": "target", "name": t.get("name"), "enabled": bool(t.get("enabled", True)),
+            "intervall": f"alle {t.get('interval_minutes')} Min" if iv else "manuell",
+            "last_run": last["zeit"] if last else 0, "next_run": nxt,
+            "ergebnis": erg, "status": "ok" if not last or last["ok"] else "fehler",
+            "fehler": "" if not last or last["ok"] else last["fehler"],
+        })
+    return JSONResponse({"watches": watches, "targets": targets})
+
+
+STYLE = """<style>
+:root{--bg:#0f1115;--card:#1a1e26;--line:#2c3340;--txt:#e8ecf1;--mut:#9aa4b2;--acc:#4caf7d;--acc-d:#1b5e20;--err:#ff8a8a}
 *{box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:0 auto;padding:1.2em 1em 3em;background:var(--bg);color:var(--txt);line-height:1.45}
 h1{font-size:1.5em;margin:.2em 0;letter-spacing:.3px}
 h1::after{content:"";display:block;height:3px;width:64px;margin-top:.3em;border-radius:2px;background:linear-gradient(90deg,var(--acc),transparent)}
 nav{position:sticky;top:0;background:rgba(15,17,21,.95);padding:.5em 0;z-index:5;border-bottom:1px solid var(--line);margin-bottom:1em}
+nav a{margin-right:.9em}
+nav a.on{font-weight:bold;color:#fff;text-decoration:none}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1.1em 1.2em;margin-bottom:1.1em;box-shadow:0 2px 10px rgba(0,0,0,.35)}
 .card h3{margin:.1em 0 .6em;font-size:1.05em}
 label{display:block;margin:.6em 0 .25em;color:var(--mut);font-size:.88em}
@@ -472,66 +559,63 @@ a{color:#7fdc7f}
 #toast span{display:inline-block;background:#222836;border:1px solid var(--line);border-radius:8px;padding:.5em .9em;margin-bottom:.5em}
 details{margin-top:.7em}summary{cursor:pointer;color:var(--mut);padding:.2em 0}
 code{background:#0c0e12;padding:.1em .4em;border-radius:4px;font-size:.88em}
+.h{display:inline-block;min-width:1.15em;height:1.15em;line-height:1.15em;text-align:center;border:1px solid var(--mut);border-radius:50%;font-size:.8em;cursor:help;margin-left:.4em;color:var(--mut)}
+.steps{background:#0c0e12;border:1px solid var(--line);border-radius:8px;padding:.7em 1em;font-size:.9em}
 @media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}body{padding:1em .7em 3em}}
-@media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}}
-</style></head><body>
-<h1>StealthScraper-LXC</h1>
-<nav><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></nav>
+</style>"""
 
-<div class="card"><h3>1. Seite pr&uuml;fen</h3>
-<label>URL</label>
-<input id="url" type="text" placeholder="https://shop.example/produkt/123">
-<div class="grid">
-<div><label>Preis-Selektor (CSS, optional)</label><input id="s_preis" type="text" placeholder=".price"></div>
-<div><label>Verf&uuml;gbarkeit-Selektor (CSS, optional)</label><input id="s_avail" type="text" placeholder=".stock, .availability"></div>
-<div><label>Anzahl/Menge-Selektor (CSS, optional)</label><input id="s_qty" type="text" placeholder=".qty, .amount"></div>
-<div><label>Titel-Selektor (CSS, optional)</label><input id="s_title" type="text" placeholder="h1"></div>
-</div>
-<label>Eigene Felder (je Zeile <i>feld=css-selektor</i>, optional)</label>
-<textarea id="s_custom" rows="2" placeholder="artikelnummer=.sku&#10;bewertung=.stars"></textarea>
-<div class="grid">
-<div><label>Warten auf Selektor (wait_for, optional)</label><input id="waitfor" type="text" placeholder=".price"></div>
-<div><label>API-Token (nur wenn in config.yaml gesetzt)</label><input id="token" type="text" placeholder="X-Token"></div>
-</div>
-<label><input id="fresh" type="checkbox"> Cache umgehen (fresh)</label>
-<div>
-<button id="b_price">Auto-Preis pr&uuml;fen</button>
-<button id="b_scrape" class="sec">Mit Selektoren scrapen</button>
-</div>
-<p class="mut">Auto-Preis braucht keine Selektoren (JSON-LD &rarr; Meta &rarr; Regex).
-Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
-</div>
+JS_BASE = """<script>
+const $=id=>document.getElementById(id);
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function hdr(){const h={'Content-Type':'application/json'};const t=localStorage.getItem('sr_token')||'';if(t)h['X-Token']=t;return h;}
+function tokQ(){const t=localStorage.getItem('sr_token')||'';return t?{headers:{'X-Token':t}}:{}}
+function toast(m,err){const t=$('toast');if(!t){alert(String(m).replace(/<[^>]*>/g,''));return;}t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',6000);}
+async function apiJSON(path,opts){const r=await fetch(path,opts);const t=await r.text();
+let d;try{d=t?JSON.parse(t):{}}catch(e){throw new Error(t.slice(0,160)||('HTTP '+r.status));}
+if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));return d;}
+function fmtT(ts){return ts?new Date(ts*1000).toLocaleString('de-DE'):'nie';}
+function fmtIn(ts){if(!ts)return'&ndash;';const s=ts-Math.floor(Date.now()/1000);if(s<=0)return'<b>f&auml;llig</b>';if(s<3600)return'in '+Math.ceil(s/60)+' Min';if(s<86400)return'in '+(s/3600).toFixed(1)+' Std';return'in '+Math.round(s/86400)+' Tg';}
+function slug(s){return (s||'').toLowerCase().replace(/[äÄ]/g,'ae').replace(/[öÖ]/g,'oe').replace(/[üÜ]/g,'ue').replace(/ß/g,'ss').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);}
+function pillInit(id,hidden){const box=$(id);if(!box)return;box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');if(hidden&&$(hidden))$(hidden).value=b.dataset.v;};});}
+function setPills(id,val){document.querySelectorAll('#'+id+' .pill').forEach(b=>b.classList.toggle('on',b.dataset.v==String(val)));}
+async function health(){try{const r=await fetch('/health');const d=await r.json();
+const h=$('health');if(h)h.innerHTML='<span class="ok">● bereit</span>';
+const b=$('build');if(b)b.textContent='· Build '+d.version;}catch(e){const h=$('health');if(h)h.innerHTML='<span class="err">● offline</span>';}}
+</script>"""
 
-<div class="card"><h3>2. Ergebnis</h3><div id="res"><span class="mut">Noch nichts geprüft.</span></div></div>
 
-<div class="card"><h3>3. Targets &amp; Verlauf</h3>
-<div><button id="b_targets" class="sec">Alle aktiven Targets pr&uuml;fen</button>
-<button id="b_hist" class="sec">Verlauf laden</button>
-<button id="b_cache" class="warn">Cache leeren</button></div>
-<div id="targets"></div><div id="hist"></div>
-<details><summary>Target anlegen / l&ouml;schen</summary>
-<div class="grid">
-<div><label>Name</label><input id="t_name" type="text" placeholder="shop-xyz"></div>
-<div><label>Warten auf Selektor (optional)</label><input id="t_wait" type="text" placeholder=".price"></div>
-</div>
-<label>URL</label><input id="t_url" type="text" placeholder="https://shop.example/produkt/1">
-<div><button id="b_tsave" class="sec">Target speichern</button>
-<button id="b_tlist" class="sec">Targets laden</button></div>
-<div id="tlist"></div></details></div>
+def _nav(active):
+    links = [("/", "Watcher"), ("/scrape", "Seite pr\u00fcfen"),
+             ("/jobs", "Jobs"), ("/settings", "Einstellungen")]
+    out = "<nav>"
+    for href, label in links:
+        cls = ' class="on"' if href == active else ""
+        out += '<a href="' + href + '"' + cls + ">" + label + "</a>"
+    return out + "</nav>"
 
-<div class="card"><h3>4. Schn&auml;ppchen-Watcher <span id="health" class="mut"></span></h3>
+
+def _page(title, active, body, script):
+    return ("<!DOCTYPE html>\n<html lang=\"de\"><head><meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<title>" + title + " \u00b7 StealthScraper-LXC</title>\n" + STYLE +
+            "</head><body>\n<h1>StealthScraper-LXC</h1>\n" + _nav(active) + "\n" + body +
+            "\n" + JS_BASE + "\n<script>\n" + script + "\n</script></body></html>")
+
+
+
+INDEX_BODY = """<div class="card"><h3>Schn&auml;ppchen-Watcher <span id="health" class="mut"></span></h3>
 <div id="toast"></div>
 <details open><summary><b>Neue Suche anlegen (Assistent)</b></summary>
 <p class="mut"><b>Schritt 1:</b> Anbieter + Suchbegriff w&auml;hlen und Suche &ouml;ffnen.
 <b>Schritt 2:</b> Dort PLZ + Umkreis + Preis filtern, URL kopieren und unten einf&uuml;gen.
 <b>Schritt 3:</b> Testen, Abstand w&auml;hlen, speichern &mdash; fertig.</p>
 <div class="grid">
-<div><label>1. Anbieter</label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select>
+<div><label>1. Anbieter <span class="h" title="Für welchen Marktplatz gilt die Suche? Erkennung geht auch automatisch per Domain.">?</span></label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select>
 <div class="mut" id="w_phinweis"></div></div>
-<div><label>Suchbegriff</label><input id="w_query" type="text" placeholder="z.B. ThinkPad T14">
+<div><label>Suchbegriff <span class="h" title="Wonach suchst du? Z.B. ThinkPad T14, OSB-Platte, Golf 7. Wird für Suche-öffnen und Namensvorschlag genutzt.">?</span></label><input id="w_query" type="text" placeholder="z.B. ThinkPad T14">
 <div><button id="b_quick" class="sec">Suche im Browser &ouml;ffnen</button></div></div>
 </div>
-<label>2. Kopierte Such-URL hier einf&uuml;gen</label>
+<label>2. Kopierte Such-URL hier einf&uuml;gen <span class="h" title="Im geöffneten Tab: PLZ/Ort + Umkreis (z.B. 10 km), Preis und Sortierung 'Neueste zuerst' einstellen, dann die Adresse aus der Browser-Adresszeile kopieren.">?</span></label>
 <input id="w_url" type="text" placeholder="https://www.kleinanzeigen.de/s-laptop/...">
 <div><button id="b_preview" class="sec">URL testen (Treffer + Median anzeigen)</button></div>
 <div id="preview"></div>
@@ -544,7 +628,7 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <div id="r_pills">
 <button class="sec pill" data-v="5">5 km</button><button class="sec pill on" data-v="10">10 km</button><button class="sec pill" data-v="20">20 km</button><button class="sec pill" data-v="30">30 km</button><button class="sec pill" data-v="50">50 km</button><button class="sec pill" data-v="100">100 km</button>
 </div>
-<label>Deal-Schwelle: <b><span id="schw_val">25</span> %</b> unter Median</label>
+<label>Deal-Schwelle: <b><span id="schw_val">25</span> %</b> unter Median <span class="h" title="Der Median ist der mittlere Preis aller Treffer. 25 % heißt: Nur Angebote, die mindestens ein Viertel unter dem üblichen Preis liegen, werden als Deal gemeldet.">?</span></label>
 <input id="w_schwelle_r" type="range" min="5" max="70" value="25" style="width:100%">
 <label>3. Wie oft pr&uuml;fen? (Minimum 15 Min &mdash; Bot-Schutz)</label>
 <div id="i_pills">
@@ -562,69 +646,16 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <button id="b_wcancel" class="sec" style="display:none">Abbrechen</button></div>
 </details>
 <h3>Geplante &amp; gelaufene Jobs</h3>
+<p class="mut">Alle Jobs mit Intervall auch auf der <a href="/jobs">Jobs-Seite</a>. Details pro Suche auf der Angebots-Unterseite.</p>
 <div><button id="b_watches" class="sec">Aktualisieren</button>
 <button id="b_deals" class="sec">Deals laden</button></div>
-<div id="watches"></div><div id="ang"></div>
+<div id="watches"></div>
 <h3>Gefundene Deals <select id="deal_filter" style="width:auto"><option value="">alle Watches</option></select></h3>
 <div id="deals"></div></div>
 
-<div class="card mut">StealthScraper-LXC <span id="build"></span> &middot; API: <code>POST /scrape</code> &middot; <code>POST /price</code> &middot;
-<code>POST /targets/check</code> &middot; <code>GET /watches</code> &middot;
-<code>POST /watches</code> &middot; <code>POST /watches/{name}/run</code> &middot;
-<code>GET /deals</code> &middot; <code>GET /providers</code> &middot;
-<code>GET /health</code> &middot; <code>DELETE /cache</code></div>
+<div class="card mut">StealthScraper-LXC <span id="build"></span></div>"""
 
-<script>
-const $=id=>document.getElementById(id);
-$('token').value=localStorage.getItem('sr_token')||'';
-$('token').onchange=e=>localStorage.setItem('sr_token',e.target.value);
-function hdr(){const h={'Content-Type':'application/json'};const t=$('token').value.trim();if(t)h['X-Token']=t;return h;}
-function tokQ(){const t=$('token').value.trim();return t?{headers:{'X-Token':t}}:{}}
-function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-function busy(b){['b_price','b_scrape','b_targets'].forEach(i=>document.getElementById(i).disabled=b);}
-function buildSel(){const s={};const g=(id,n)=>{const v=$(id).value.trim();if(v)s[n]=v;};
-g('s_preis','preis');g('s_avail','verfuegbarkeit');g('s_qty','anzahl');g('s_title','titel');
-$('s_custom').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),v=l.slice(i+1).trim();if(k&&v)s[k]=v;}});return s;}
-function row(k,v,cls){return '<tr><th>'+esc(k)+'</th><td class="'+(cls||'')+'">'+esc(v)+'</td></tr>';}
-function render(d){
-let h='<table>';
-['titel','preis','waehrung','verfuegbarkeit','quelle','status','cached','url'].forEach(k=>{if(d[k]!==undefined&&d[k]!==''&&d[k]!==null)h+=row(k,d[k],k==='preis'?'ok':'');});
-const sub=(o,t)=>{if(o&&typeof o==='object')Object.keys(o).forEach(k=>{h+=row(t+': '+k,o[k]);});};
-sub(d.felder,'Feld');sub(d.auto,'Auto');
-if(d.fehler)h+=row('Fehler',d.fehler,'err');
-h+='</table><details><summary>Roh-JSON</summary><pre>'+esc(JSON.stringify(d,null,2))+'</pre></details>';
-$('res').innerHTML=h;}
-async function call(path,body){
-const u=$('url').value.trim();if(!u&&body.url!==undefined&&!body.url){$('res').innerHTML='<span class="err">Bitte URL eingeben.</span>';return;}
-busy(true);$('res').innerHTML='<span class="mut">L&auml;dt &hellip;</span>';
-try{render(await apiJSON(path,{method:'POST',headers:hdr(),body:JSON.stringify(body)}));}
-catch(e){$('res').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}busy(false);}
-$('b_price').onclick=()=>call('/price',{url:$('url').value.trim(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
-$('b_scrape').onclick=()=>call('/scrape',{url:$('url').value.trim(),selectors:buildSel(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
-$('b_targets').onclick=async()=>{busy(true);$('targets').innerHTML='<span class="mut">Pr&uuml;fe &hellip;</span>';
-try{const r=await fetch('/targets/check',{method:'POST',headers:hdr(),body:'{}'});const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
-let h='<table><tr><th>Name</th><th>Preis</th><th>Verf&uuml;gbarkeit</th><th>Status</th></tr>';
-d.forEach(t=>{h+='<tr><td>'+esc(t.name)+'</td><td>'+esc(t.preis||t.fehler||'-')+'</td><td>'+esc(t.verfuegbarkeit||'-')+'</td><td>'+(t.ok?'<span class="ok">ok</span>':'<span class="err">fehler</span>')+'</td></tr>';});
-h+='</table>';$('targets').innerHTML=h;}catch(e){$('targets').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}busy(false);};
-$('b_hist').onclick=async()=>{const o=tokQ();try{const r=await fetch('/results',o);const d=await r.json();
-if(!d.length){$('hist').innerHTML='<span class="mut">Keine Verlaufsdaten.</span>';return;}
-let h='';d.forEach(f=>{h+='<details><summary>'+esc(f.datei)+' ('+f.eintraege.length+' Eintr&auml;ge)</summary><pre>'+esc(JSON.stringify(f.eintraege,null,2).slice(0,4000))+'</pre></details>';});
-$('hist').innerHTML=h;}catch(e){$('hist').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}};
-$('b_cache').onclick=async()=>{try{await fetch('/cache',{method:'DELETE',headers:hdr()});alert('Cache geleert');}catch(e){alert('Fehler: '+e.message);}};
-$('b_tsave').onclick=async()=>{const b={name:$('t_name').value.trim(),url:$('t_url').value.trim(),wait_for:$('t_wait').value.trim()};
-if(!b.name||!b.url){alert('Name und URL ausfüllen');return;}
-try{const r=await fetch('/targets',{method:'POST',headers:hdr(),body:JSON.stringify(b)});const d=await r.json();
-if(!r.ok)throw new Error(d.detail||r.status);$('t_name').value='';$('t_url').value='';loadTargets();}catch(e){alert('Fehler: '+e.message);}};
-async function loadTargets(){try{const r=await fetch('/targets',tokQ());const d=await r.json();
-if(!d.length){$('tlist').innerHTML='<p class="mut">Keine Targets.</p>';return;}
-let h='<table><tr><th>Name</th><th>URL</th><th>Aktion</th></tr>';
-d.forEach(t=>{h+='<tr><td>'+esc(t.name)+'</td><td><span class="mut">'+esc((t.url||'').slice(0,70))+'&hellip;</span></td>'
-+'<td><button class="warn" onclick="delTarget(\\''+esc(t.name)+'\\')">L&ouml;schen</button></td></tr>';});
-h+='</table>';$('tlist').innerHTML=h;}catch(e){$('tlist').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
-async function delTarget(n){if(!confirm('Target \\''+n+'\\' löschen?'))return;
-try{await fetch('/targets/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadTargets();}catch(e){alert('Fehler: '+e.message);}}
-$('b_tlist').onclick=loadTargets;loadTargets();
-async function loadProviders(){try{const r=await fetch('/providers',tokQ());const d=await r.json();
+INDEX_JS = """async function loadProviders(){try{const d=await apiJSON('/providers',tokQ());
 PROV=d;const s=$('w_provider');d.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=p.label;if(p.key==='generisch')o.textContent+=' (alle anderen Shops)';s.appendChild(o);});updPhinweis();}catch(e){}}
 let PROV=[];
 function updPhinweis(){const p=(PROV||[]).find(x=>x.key===$('w_provider').value);
@@ -632,13 +663,8 @@ $('w_phinweis').textContent=p&&p.hinweis?p.hinweis:'';
 $('b_quick').style.display=(p&&p.suchlink)?'':'none';}
 $('w_provider').onchange=updPhinweis;
 $('w_query').oninput=e=>{if(!$('w_name').value.trim())$('w_name').value=slug(e.target.value);};
-function pillInit(id,hidden){const box=$(id);if(!box)return;box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');if(hidden&&$(hidden))$(hidden).value=b.dataset.v;};});}
 pillInit('r_pills');pillInit('i_pills','w_interval');
 $('w_schwelle_r').oninput=e=>{$('schw_val').textContent=e.target.value;};
-function toast(m,err){const t=$('toast');t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',6000);}
-async function apiJSON(path,opts){const r=await fetch(path,opts);const t=await r.text();
-let d;try{d=t?JSON.parse(t):{}}catch(e){throw new Error(t.slice(0,160)||('HTTP '+r.status));}
-if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));return d;}
 function radiusVal(){const b=document.querySelector('#r_pills .pill.on');return b?parseInt(b.dataset.v):10;}
 $('b_quick').onclick=async()=>{const q=$('w_query').value.trim();if(!q){toast('Erst Suchbegriff eingeben',1);return;}
 try{const d=await apiJSON('/watches/quicklink',{method:'POST',headers:hdr(),body:JSON.stringify({provider:$('w_provider').value,query:q})});
@@ -654,7 +680,6 @@ if(d.beispiele&&d.beispiele.length){h+='<table><tr><th>Beispiel</th><th>Preis</t
 d.beispiele.forEach(b=>{h+='<tr><td>'+esc(b.titel||b.url)+'</td><td>'+(b.preis??'&ndash;')+' &euro;</td></tr>';});h+='</table>';}
 else h+='<p class="err">Keine Treffer erkannt &mdash; URL oder Selektoren prüfen.</p>';
 $('preview').innerHTML=h;}catch(e){$('preview').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}};
-function slug(s){return (s||'').toLowerCase().replace(/[äÄ]/g,'ae').replace(/[öÖ]/g,'oe').replace(/[üÜ]/g,'ue').replace(/ß/g,'ss').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);}
 function wBody(){const v=id=>$(id).value.trim();
 const sel={};$('w_sel').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),vv=l.slice(i+1).trim();if(k&&vv)sel[k]=vv;}});
 const b={name:v('w_name')||slug(v('w_query'))||('watch-'+Date.now().toString(36)),enabled:$('w_enabled').checked,provider:$('w_provider').value,search_url:v('w_url'),
@@ -662,7 +687,7 @@ query:v('w_query'),plz:v('w_plz'),radius_km:radiusVal(),
 deal_schwelle_prozent:parseInt($('w_schwelle_r').value)||25,interval_minutes:parseInt($('w_interval').value)||60,
 notify_webhook:v('w_hook'),selectors:sel};const mp=v('w_maxpreis');if(mp)b.max_preis=parseFloat(mp);return b;}
 let EDIT=null;
-function setPills(id,val){document.querySelectorAll('#'+id+' .pill').forEach(b=>b.classList.toggle('on',b.dataset.v==String(val)));}
+function setPillsLocal(id,val){setPills(id,val);}
 $('b_wsave').onclick=async()=>{const b=wBody();if(!b.search_url){toast('Such-URL einfügen',1);return;}
 try{let d;
 if(EDIT){d=await apiJSON('/watches/'+encodeURIComponent(EDIT),{method:'PUT',headers:hdr(),body:JSON.stringify(b)});cancelEdit();toast('Gespeichert: '+d.name);}
@@ -681,9 +706,7 @@ const sel=w.selectors||{};$('w_sel').value=Object.keys(sel).map(k=>k+'='+sel[k])
 $('b_wsave').textContent='Änderungen speichern';$('b_wcancel').style.display='';
 toast('Bearbeite '+n+' (Name fest, Rest änderbar)');window.scrollTo({top:0,behavior:'smooth'});
 }catch(e){toast('Fehler: '+e.message,1);}}
-function fmtT(ts){return ts?new Date(ts*1000).toLocaleString('de-DE'):'nie';}
-function fmtIn(ts){if(!ts)return'&ndash;';const s=ts-Math.floor(Date.now()/1000);if(s<=0)return'<b>f&auml;llig</b>';if(s<3600)return'in '+Math.ceil(s/60)+' Min';if(s<86400)return'in '+(s/3600).toFixed(1)+' Std';return'in '+Math.round(s/86400)+' Tg';}
-async function loadWatches(){try{const r=await fetch('/watches',tokQ());const d=await r.json();
+async function loadWatches(){try{const r=await fetch('/watches',tokQ());const t=await r.text();const d=t?JSON.parse(t):[];
 const df=$('deal_filter');const cur=df.value;df.innerHTML='<option value="">alle Watches</option>';
 d.forEach(w=>{const o=document.createElement('option');o.value=w.name;o.textContent=w.name;df.appendChild(o);});df.value=cur;
 if(!d.length){$('watches').innerHTML='<p class="mut">Noch keine Jobs. Lege oben deine erste Suche an.</p>';return;}
@@ -694,40 +717,230 @@ h+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)
 +'<td>alle '+w.interval_minutes+' Min</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
 +'<td>'+erg+'</td><td>'+(w.last_status==='ok'?'<span class="ok">ok</span>':w.last_status==='nie'?'<span class="mut">wartet</span>':'<span class="err">'+esc(w.last_status)+'</span>')+(w.last_error?'<br><span class="mut">'+esc(w.last_error.slice(0,80))+'</span>':'')+'</td>'
 +'<td><button class="sec" onclick="runWatch(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
-+'<button class="sec" onclick="showAngebote(\\''+esc(w.name)+'\\')">Angebote</button> '
++'<a target="_blank" href="/watch/'+encodeURIComponent(w.name)+'"><button class="sec">Angebote</button></a> '
 +'<button class="sec" onclick="editWatch(\\''+esc(w.name)+'\\')">Bearbeiten</button><br>'
 +'<button class="sec" onclick="toggleWatch(\\''+esc(w.name)+'\\','+(w.enabled?'0':'1')+')">'+(w.enabled?'Pausieren':'Aktivieren')+'</button> '
 +'<button class="warn" onclick="delWatch(\\''+esc(w.name)+'\\')">L&ouml;schen</button></td></tr>';});
 h+='</table>';$('watches').innerHTML=h;}catch(e){$('watches').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
 $('b_watches').onclick=loadWatches;
-async function toggleWatch(n,en){try{const r=await fetch('/watches',tokQ());const d=await r.json();
+async function toggleWatch(n,en){try{const d=await apiJSON('/watches',tokQ());
 const w=d.find(x=>x.name===n);if(!w)return;w.enabled=!!en;
-const p=await fetch('/watches/'+encodeURIComponent(n),{method:'PUT',headers:hdr(),body:JSON.stringify(w)});
-if(!p.ok){const e=await p.json();throw new Error(e.detail||p.status);}loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
+await apiJSON('/watches/'+encodeURIComponent(n),{method:'PUT',headers:hdr(),body:JSON.stringify(w)});loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
 async function runWatch(n){toast('Prüfe '+n+' … (dauert ca. 30–60 s)');
 try{const d=await apiJSON('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
-toast(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();showAngebote(n,true);}catch(e){toast('Fehler: '+e.message,1);loadWatches();}}
-async function showAngebote(n,silent){try{const d=await apiJSON('/watches/'+encodeURIComponent(n)+'/angebote?limit=100',tokQ());
-if(!d.length){if(!silent)$('ang').innerHTML='<p class="mut">Keine Angebote gespeichert &mdash; erst „Jetzt prüfen“.</p>';return;}
-let h='<h3>Zuletzt gefundene Angebote: '+esc(n)+' ('+d.length+')</h3><table><tr><th>Angebot</th><th>Preis</th><th>Ort</th></tr>';
-d.forEach(a=>{h+='<tr><td><a target="_blank" href="'+esc(a.url)+'">'+esc(a.titel||a.url)+'</a></td>'
-+'<td>'+(a.preis??esc(a.preis_text||'&ndash;'))+' &euro;</td><td>'+esc(a.ort||'&ndash;')+'</td></tr>';});
-h+='</table>';$('ang').innerHTML=h;}catch(e){if(!silent)toast('Fehler: '+e.message,1);}}
-async function delWatch(n){if(!confirm('Watch \\''+n+'\\' löschen?'))return;
-try{await fetch('/watches/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
+toast(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();}catch(e){toast('Fehler: '+e.message,1);loadWatches();}}
+async function delWatch(n){if(!confirm('Watch \\''+n+'\\' wirklich löschen?'))return;
+await apiJSON('/watches/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()}).then(loadWatches).catch(e=>toast('Fehler: '+e.message,1));}
 async function loadDeals(){const wf=$('deal_filter').value;const q=wf?'?watch='+encodeURIComponent(wf)+'&limit=50':'?limit=50';
-try{const r=await fetch('/deals'+q,tokQ());const d=await r.json();
+try{const d=await apiJSON('/deals'+q,tokQ());
 if(!d.length){$('deals').innerHTML='<p class="mut">Noch keine Deals gefunden.</p>';return;}
 let h='<table><tr><th>Deal</th><th>Preis</th><th>Median</th><th>Grund</th><th>Wann</th></tr>';
-d.forEach(t=>{h+='<tr><td><a style="color:#7fdc7f" target="_blank" href="'+esc(t.url)+'">'+esc(t.titel||t.url)+'</a><br><span class="mut">'+esc(t.watch)+'</span></td>'
+d.forEach(t=>{h+='<tr><td><a target="_blank" href="'+esc(t.url)+'">'+esc(t.titel||t.url)+'</a><br><span class="mut">'+esc(t.watch)+'</span></td>'
 +'<td>'+esc(t.preis)+' € <span class="badge">-'+esc(t.rabatt)+'%</span></td><td>'+esc(t.median)+' €</td>'
 +'<td>'+esc(t.grund)+'</td><td>'+new Date(t.zeit*1000).toLocaleString('de-DE')+'</td></tr>';});
 h+='</table>';$('deals').innerHTML=h;}catch(e){$('deals').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
 $('b_deals').onclick=loadDeals;$('deal_filter').onchange=loadDeals;
-async function health(){try{const r=await fetch('/health');const d=await r.json();
-$('health').innerHTML='<span class="ok">● bereit</span>';$('build').textContent='· Build '+d.version;}catch(e){$('health').innerHTML='<span class="err">● offline</span>';}}
 loadProviders();loadWatches();loadDeals();health();setInterval(loadWatches,60000);
-</script></body></html>"""
+const _eq=new URLSearchParams(location.search).get('edit');if(_eq)editWatch(_eq);"""
+
+
+
+SCRAPE_BODY = """<div class="card"><h3>Seite pr&uuml;fen <span id="health" class="mut"></span></h3>
+<div id="toast"></div>
+<label>URL <span class="h" title="Genaue Adresse der Seite aus der Browser-Adresszeile kopieren, z.B. https://shop.de/produkt/123.">?</span></label>
+<input id="url" type="text" placeholder="https://shop.example/produkt/123">
+<div class="grid">
+<div><label>Preis-Selektor (optional) <span class="h" title="CSS-Selektor, der genau auf den Preis zeigt, z.B. .price. Leer lassen = Auto-Erkennung (JSON-LD, Meta, sichtbarer Preis). Finden: siehe Anleitung unten.">?</span></label><input id="s_preis" type="text" placeholder=".price"></div>
+<div><label>Verf&uuml;gbarkeit-Selektor (optional) <span class="h" title="CSS-Selektor für den Lager-Text, z.B. .stock oder .availability. Leer = automatische Textsuche (auf Lager, lieferbar, ausverkauft ...).">?</span></label><input id="s_avail" type="text" placeholder=".stock, .availability"></div>
+<div><label>Anzahl/Menge-Selektor (optional) <span class="h" title="CSS-Selektor für Mengen-/Stückzahl-Angaben, z.B. .qty. Nur wenn die Seite so etwas zeigt.">?</span></label><input id="s_qty" type="text" placeholder=".qty, .amount"></div>
+<div><label>Titel-Selektor (optional) <span class="h" title="CSS-Selektor für die Überschrift, z.B. h1. Leer = Seitentitel wird genommen.">?</span></label><input id="s_title" type="text" placeholder="h1"></div>
+</div>
+<label>Eigene Felder (je Zeile <i>feld=css-selektor</i>, optional) <span class="h" title="Eigene Werte auslesen, z.B. artikelnummer=.sku pro Zeile. Links der Feldname, rechts der CSS-Selektor.">?</span></label>
+<textarea id="s_custom" rows="2" placeholder="artikelnummer=.sku&#10;bewertung=.stars"></textarea>
+<div class="grid">
+<div><label>Warten auf Selektor (optional) <span class="h" title="Wenn Preise per JavaScript nachladen: Selektor angeben, auf den gewartet wird (z.B. .price). Leer lassen wenn unsicher.">?</span></label><input id="waitfor" type="text" placeholder=".price"></div>
+<div><label>API-Token (nur wenn in config.yaml gesetzt)</label><input id="token" type="text" placeholder="X-Token"></div>
+</div>
+<label><input id="fresh" type="checkbox"> Cache umgehen (fresh)</label>
+<div>
+<button id="b_price">Auto-Preis pr&uuml;fen</button>
+<button id="b_scrape" class="sec">Mit Selektoren scrapen</button>
+</div>
+<p class="mut">Auto-Preis braucht keine Selektoren (JSON-LD &rarr; Meta &rarr; sichtbarer Preis &rarr; Regex).
+Alle gefundenen Preisquellen werden als Kandidaten angezeigt.</p>
+<details><summary><b>So findest du CSS-Selektoren (30 Sekunden)</b></summary>
+<div class="steps"><ol>
+<li>Seite im <b>Chrome/Firefox</b> öffnen, <b>F12</b> drücken (Entwicklertools).</li>
+<li>Oben links das <b>Pfeil-Symbol</b> (Element auswählen) anklicken, dann auf den <b>Preis</b> klicken.</li>
+<li>Im HTML-Baum Rechtsklick auf die markierte Zeile &rarr; <b>Kopieren &rarr; Selector kopieren</b>.</li>
+<li>Kopierten Wert oben einfügen und testen. Reicht eine Klasse wie <code>.price</code>, nimm die kurze Form.</li>
+<li>Mehrere Treffer? Komma-getrennt angeben, der erste Treffer gewinnt.</li>
+</ol></div></details>
+</div>
+
+<div class="card"><h3>Ergebnis</h3><div id="res"><span class="mut">Noch nichts geprüft.</span></div></div>
+
+<div class="card"><h3>Als wiederkehrenden Job speichern</h3>
+<p class="mut">Legt diese Abfrage als Target an &mdash; erscheint in der <a href="/jobs">Jobs-Tabelle</a> und läuft automatisch im gewählten Abstand.</p>
+<div class="grid">
+<div><label>Job-Name</label><input id="j_name" type="text" placeholder="bauhaus-osb"></div>
+<div><label>Abstand</label><div id="j_pills">
+<button class="sec pill on" data-v="0">manuell</button><button class="sec pill" data-v="60">st&uuml;ndlich</button><button class="sec pill" data-v="360">alle 6 Std</button><button class="sec pill" data-v="1440">t&auml;glich</button>
+</div></div>
+</div>
+<input id="j_interval" type="hidden" value="0">
+<div><button id="b_jsave" class="sec">Als Job speichern</button></div>
+</div>
+
+<div class="card mut">StealthScraper-LXC <span id="build"></span></div>"""
+
+SCRAPE_JS = """$('token').value=localStorage.getItem('sr_token')||'';
+$('token').onchange=e=>localStorage.setItem('sr_token',e.target.value);
+function hdr(){const h={'Content-Type':'application/json'};const t=$('token').value.trim();if(t)h['X-Token']=t;return h;}
+function tokQ(){const t=$('token').value.trim();return t?{headers:{'X-Token':t}}:{}}
+function busy(b){['b_price','b_scrape'].forEach(i=>{const e=$(i);if(e)e.disabled=b;});}
+function buildSel(){const s={};const g=(id,n)=>{const v=$(id).value.trim();if(v)s[n]=v;};
+g('s_preis','preis');g('s_avail','verfuegbarkeit');g('s_qty','anzahl');g('s_title','titel');
+$('s_custom').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),v=l.slice(i+1).trim();if(k&&v)s[k]=v;}});return s;}
+function row(k,v,cls){return '<tr><th>'+esc(k)+'</th><td class="'+(cls||'')+'">'+esc(v)+'</td></tr>';}
+function render(d){
+let h='<table>';
+['titel','preis','waehrung','verfuegbarkeit','quelle','status','cached','url'].forEach(k=>{if(d[k]!==undefined&&d[k]!==''&&d[k]!==null)h+=row(k,d[k],k==='preis'?'ok':'');});
+const sub=(o,t)=>{if(o&&typeof o==='object')Object.keys(o).forEach(k=>{h+=row(t+': '+k,o[k]);});};
+sub(d.felder,'Feld');sub(d.auto,'Auto');
+if(d.kandidaten&&d.kandidaten.length){h+='<tr><th>Preis-Kandidaten</th><td><table>';
+d.kandidaten.forEach(k=>{h+='<tr><td><b>'+esc(k.wert)+' &euro;</b></td><td>'+esc(k.quelle)+'</td><td><span class="mut">'+esc(k.detail||'')+'</span></td></tr>';});
+h+='</table><span class="mut">Gewählt: '+esc(d.quelle)+' &mdash; stimmt der Preis nicht, eigenen Preis-Selektor setzen.</span></td></tr>';}
+if(d.fehler)h+=row('Fehler',d.fehler,'err');
+h+='</table><details><summary>Roh-JSON</summary><pre>'+esc(JSON.stringify(d,null,2))+'</pre></details>';
+$('res').innerHTML=h;}
+async function call(path,body){
+const u=$('url').value.trim();if(!u&&body.url!==undefined&&!body.url){$('res').innerHTML='<span class="err">Bitte URL eingeben.</span>';return;}
+busy(true);$('res').innerHTML='<span class="mut">L&auml;dt &hellip;</span>';
+try{render(await apiJSON(path,{method:'POST',headers:hdr(),body:JSON.stringify(body)}));}
+catch(e){$('res').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}busy(false);}
+$('b_price').onclick=()=>call('/price',{url:$('url').value.trim(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
+$('b_scrape').onclick=()=>call('/scrape',{url:$('url').value.trim(),selectors:buildSel(),wait_for:$('waitfor').value.trim(),fresh:$('fresh').checked});
+pillInit('j_pills','j_interval');
+$('b_jsave').onclick=async()=>{const u=$('url').value.trim();const n=$('j_name').value.trim()||slug(u.split('/')[2]||'seite');
+if(!u){toast('Erst URL eingeben und prüfen',1);return;}
+try{const d=await apiJSON('/targets',{method:'POST',headers:hdr(),body:JSON.stringify({name:n,url:u,wait_for:$('waitfor').value.trim(),selectors:buildSel(),interval_minutes:parseInt($('j_interval').value)||0})});
+toast('Job gespeichert: '+d.name+(d.interval_minutes?' (alle '+d.interval_minutes+' Min)':' (manuell)')+' — siehe Jobs-Seite');}catch(e){toast('Fehler: '+e.message,1);}};
+health();"""
+
+
+
+JOBS_BODY = """<div class="card"><h3>Alle Jobs <span id="health" class="mut"></span></h3>
+<div id="toast"></div>
+<p class="mut">Watches (Schnäppchen) und Targets (Seite prüfen) mit eigenem Prüf-Abstand.
+Bearbeiten: Watches auf der <a href="/">Startseite</a> (oder ?edit=), Targets hier unten.</p>
+<div><button id="b_reload" class="sec">Aktualisieren</button></div>
+<h3>Schnäppchen-Watches</h3>
+<div id="jw"></div>
+<h3>Seite-prüfen-Jobs (Targets)</h3>
+<div id="jt"></div>
+<div id="thist"></div>
+<details id="teditbox" style="display:none"><summary><b>Target bearbeiten</b></summary>
+<div class="grid">
+<div><label>Name (fest)</label><input id="t2_name" type="text" disabled></div>
+<div><label>Warten auf Selektor</label><input id="t2_wait" type="text"></div>
+</div>
+<label>URL</label><input id="t2_url" type="text">
+<label>Abstand (0 = nur manuell)</label>
+<div id="t2_pills">
+<button class="sec pill" data-v="0">manuell</button><button class="sec pill" data-v="15">alle 15 Min</button><button class="sec pill" data-v="60">st&uuml;ndlich</button><button class="sec pill" data-v="360">alle 6 Std</button><button class="sec pill" data-v="1440">t&auml;glich</button>
+</div>
+<input id="t2_interval" type="hidden" value="0">
+<label>Selektoren (je Zeile <i>feld=css</i>)</label>
+<textarea id="t2_sel" rows="2"></textarea>
+<label><input id="t2_enabled" type="checkbox" checked> Aktiviert</label>
+<div><button id="b_t2save">Änderungen speichern</button>
+<button id="b_t2cancel" class="sec">Abbrechen</button></div>
+</details></div>
+
+<div class="card mut">StealthScraper-LXC <span id="build"></span></div>"""
+
+JOBS_JS = """async function loadJobs(){try{const d=await apiJSON('/jobs',tokQ());
+let h='<table><tr><th>Job</th><th>Intervall</th><th>Zuletzt</th><th>N&auml;chster Lauf</th><th>Ergebnis</th><th>Status</th><th>Aktion</th></tr>';
+if(!d.watches.length)h+='<tr><td colspan="7"><span class="mut">Keine Watches — <a href="/">anlegen</a></span></td></tr>';
+d.watches.forEach(w=>{
+h+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)</span>')+'</td>'
++'<td>'+esc(w.intervall)+'</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
++'<td>'+esc(w.ergebnis)+'</td><td>'+(w.status==='ok'?'<span class="ok">ok</span>':w.status==='nie'?'<span class="mut">wartet</span>':'<span class="err">'+esc(w.status)+'</span>')+'</td>'
++'<td><button class="sec" onclick="runWatch(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
++'<a target="_blank" href="/watch/'+encodeURIComponent(w.name)+'"><button class="sec">Angebote</button></a> '
++'<a href="/?edit='+encodeURIComponent(w.name)+'"><button class="sec">Bearbeiten</button></a></td></tr>';});
+h+='</table>';$('jw').innerHTML=h;
+let t='<table><tr><th>Job</th><th>Intervall</th><th>Zuletzt</th><th>N&auml;chster Lauf</th><th>Ergebnis</th><th>Status</th><th>Aktion</th></tr>';
+if(!d.targets.length)t+='<tr><td colspan="7"><span class="mut">Keine Targets — auf <a href="/scrape">Seite prüfen</a> als Job speichern.</span></td></tr>';
+d.targets.forEach(w=>{
+t+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)</span>')+'</td>'
++'<td>'+esc(w.intervall)+'</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
++'<td>'+esc(w.ergebnis)+(w.fehler?'<br><span class="mut">'+esc(w.fehler.slice(0,80))+'</span>':'')+'</td>'
++'<td>'+(w.status==='ok'?'<span class="ok">ok</span>':'<span class="err">fehler</span>')+'</td>'
++'<td><button class="sec" onclick="runTarget(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
++'<button class="sec" onclick="showRuns(\\''+esc(w.name)+'\\')">Verlauf</button> '
++'<button class="sec" onclick="editTarget(\\''+esc(w.name)+'\\')">Bearbeiten</button><br>'
++'<button class="warn" onclick="delTarget(\\''+esc(w.name)+'\\')">L&ouml;schen</button></td></tr>';});
+t+='</table>';$('jt').innerHTML=t;}catch(e){$('jw').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
+$('b_reload').onclick=loadJobs;
+async function runWatch(n){toast('Prüfe '+n+' …');
+try{const d=await apiJSON('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
+toast(d.watch+': '+d.angebote_gesamt+' Angebote, '+d.deals.length+' Deals');loadJobs();}catch(e){toast('Fehler: '+e.message,1);loadJobs();}}
+async function runTarget(n){toast('Prüfe '+n+' …');
+try{const d=await apiJSON('/targets/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
+toast(d.ok?(d.titel.slice(0,60)+' — '+d.preis+' €'):'Fehler: '+d.fehler, d.ok?0:1);loadJobs();showRuns(n);}catch(e){toast('Fehler: '+e.message,1);}}
+async function delTarget(n){if(!confirm('Target \\''+n+'\\' löschen?'))return;
+await apiJSON('/targets/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()}).then(loadJobs).catch(e=>toast('Fehler: '+e.message,1));}
+async function showRuns(n){try{const d=await apiJSON('/targets/'+encodeURIComponent(n)+'/runs?limit=20',tokQ());
+if(!d.length){$('thist').innerHTML='<p class="mut">Noch keine Läufe.</p>';return;}
+let h='<h3>Verlauf: '+esc(n)+'</h3><table><tr><th>Wann</th><th>Ergebnis</th><th>Status</th></tr>';
+d.forEach(r=>{h+='<tr><td>'+fmtT(r.zeit)+'</td><td>'+esc((r.titel||'').slice(0,60)+' '+(r.preis||'')+(r.preis?' €':''))+(r.fehler?'<br><span class="err">'+esc(r.fehler.slice(0,100))+'</span>':'')+'</td><td>'+(r.ok?r.status:'<span class="err">fehler</span>')+'</td></tr>';});
+h+='</table>';$('thist').innerHTML=h;}catch(e){toast('Fehler: '+e.message,1);}}
+let TEDIT=null;
+pillInit('t2_pills','t2_interval');
+async function editTarget(n){try{const d=await apiJSON('/targets',tokQ());const w=d.find(x=>x.name===n);if(!w)return;
+TEDIT=n;$('t2_name').value=w.name;$('t2_url').value=w.url||'';$('t2_wait').value=w.wait_for||'';
+setPills('t2_pills',w.interval_minutes||0);$('t2_interval').value=w.interval_minutes||0;
+$('t2_enabled').checked=w.enabled!==false;
+const sel=w.selectors||{};$('t2_sel').value=Object.keys(sel).map(k=>k+'='+sel[k]).join('\\n');
+$('teditbox').style.display='';window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});}catch(e){toast('Fehler: '+e.message,1);}}
+$('b_t2cancel').onclick=()=>{TEDIT=null;$('teditbox').style.display='none';};
+$('b_t2save').onclick=async()=>{if(!TEDIT)return;const sel={};
+$('t2_sel').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),v=l.slice(i+1).trim();if(k&&v)sel[k]=v;}});
+try{await apiJSON('/targets/'+encodeURIComponent(TEDIT),{method:'PUT',headers:hdr(),body:JSON.stringify({name:TEDIT,url:$('t2_url').value.trim(),wait_for:$('t2_wait').value.trim(),selectors:sel,interval_minutes:parseInt($('t2_interval').value)||0,enabled:$('t2_enabled').checked})});
+toast('Gespeichert: '+TEDIT);TEDIT=null;$('teditbox').style.display='none';loadJobs();}catch(e){toast('Fehler: '+e.message,1);}};
+loadJobs();health();setInterval(loadJobs,60000);"""
+
+
+
+INDEX_HTML = _page("Watcher", "/", INDEX_BODY, INDEX_JS)
+SCRAPE_HTML = _page("Seite pr\u00fcfen", "/scrape", SCRAPE_BODY, SCRAPE_JS)
+JOBS_HTML = _page("Jobs", "/jobs", JOBS_BODY, JOBS_JS)
+
+
+def watch_detail_page(name, snapshot):
+    rows = "".join(
+        "<tr><td><a target=\"_blank\" href=\"" + html.escape(a.get("url", "")) + "\">" +
+        html.escape(a.get("titel") or a.get("url", "")) + "</a></td><td>" +
+        html.escape(str(a.get("preis", "")) if a.get("preis") is not None else
+                    a.get("preis_text", "")) + " &euro;</td><td>" +
+        html.escape(a.get("ort") or "&ndash;") + "</td></tr>"
+        for a in snapshot
+    )
+    body = ("<div class=\"card\"><h3>Angebote: " + html.escape(name) + "</h3>"
+            "<div id=\"toast\"></div>"
+            "<p class=\"mut\">Alle Treffer des letzten Laufs &mdash; auch ohne Deal, zum Nachpr\u00fcfen. "
+            "<a href=\"/\">Zur\u00fcck zum Watcher</a> &middot; <a href=\"/jobs\">Alle Jobs</a></p>"
+            + ("<table><tr><th>Angebot</th><th>Preis</th><th>Ort</th></tr>" + rows + "</table>"
+               if snapshot else "<p class=\"mut\">Noch keine Angebote gespeichert &mdash; erst „Jetzt pr\u00fcfen“.</p>")
+            + "</div><div class=\"card mut\">StealthScraper-LXC</div>")
+    return ("<!DOCTYPE html>\n<html lang=\"de\"><head><meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<title>Angebote \u00b7 StealthScraper-LXC</title>\n" + STYLE +
+            "</head><body>\n<h1>StealthScraper-LXC</h1>\n" + _nav("/") + "\n" + body +
+            "\n</body></html>")
+
 
 
 SETTINGS_HTML = """<!DOCTYPE html>
@@ -752,7 +965,7 @@ a{color:#7fdc7f}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style></head><body>
 <h1>Einstellungen</h1>
-<nav><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></nav>
+<nav><a href="/">Watcher</a> &middot; <a href="/scrape">Seite pr&uuml;fen</a> &middot; <a href="/jobs">Jobs</a> &middot; <a href="/settings">Einstellungen</a></nav>
 <div id="msg"></div>
 <div class="card"><h3>Server</h3>
 <div class="grid">
@@ -823,7 +1036,25 @@ async def settings_page():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return DASHBOARD_HTML
+    return INDEX_HTML
+
+
+@app.get("/scrape", response_class=HTMLResponse)
+async def scrape_page():
+    return SCRAPE_HTML
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+async def jobs_page():
+    return JOBS_HTML
+
+
+@app.get("/watch/{name}", response_class=HTMLResponse)
+async def watch_page(name: str):
+    cfg = _fresh_cfg()
+    if not any(w.get("name") == name for w in (cfg.get("watches", []) or [])):
+        raise HTTPException(status_code=404, detail="Watch nicht gefunden")
+    return watch_detail_page(name, WDB.get_snapshot(name, 200))
 
 
 async def _fetch_cached(url: str, wait_for: str, extra: str, fresh: bool) -> dict:
@@ -885,16 +1116,9 @@ async def targets_check(x_token: str | None = Header(default=None)):
     _auth(x_token)
     out = []
     for t in _fresh_cfg().get("targets", []) or []:
-        if not t.get("enabled"):
+        if not t.get("enabled", True):
             continue
-        try:
-            page = await _fetch_cached(t["url"], t.get("wait_for", ""), "price", fresh=True)
-            info = auto_price(page["html"])
-            if t.get("selectors"):
-                info["felder"] = extract_with_selectors(page["html"], t["selectors"])
-            out.append({"name": t.get("name"), "ok": True, "status": page["status"], **info})
-        except Exception as e:
-            out.append({"name": t.get("name"), "ok": False, "fehler": str(e)})
+        out.append(await run_target(SCRAPER, t, WDB))
     # Ergebnisse als JSON ablegen (für Timer-Läufe)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (RESULTS_DIR / f"check-{int(time.time())}.json").write_text(
