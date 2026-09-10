@@ -12,14 +12,24 @@ from .config import load_config, resolve_config_path
 from .watcher import MIN_INTERVAL_MINUTES, WatchDB, run_watch
 
 
+def interval_seconds(watch: dict) -> int:
+    return max(int(watch.get("interval_minutes", 60) or 60), MIN_INTERVAL_MINUTES) * 60
+
+
+def next_run_ts(watch: dict, last_run: int, now: int | None = None) -> int:
+    """Nächster geplanter Lauf (Jobs-Tabelle: 'geplant')."""
+    now = now if now is not None else int(time.time())
+    nxt = last_run + interval_seconds(watch)
+    return nxt if nxt > now else now  # überfällig -> jetzt fällig
+
+
 def due_watches(cfg: dict, db: WatchDB, now: int | None = None) -> list[dict]:
     now = now if now is not None else int(time.time())
     due = []
     for w in cfg.get("watches", []) or []:
         if not w.get("enabled") or not w.get("search_url"):
             continue
-        interval = max(int(w.get("interval_minutes", 60) or 60), MIN_INTERVAL_MINUTES) * 60
-        if now - db.last_run(w.get("name", "")) >= interval:
+        if now - db.last_run(w.get("name", "")) >= interval_seconds(w):
             due.append(w)
     return due
 
@@ -37,7 +47,10 @@ async def scheduler_loop(scraper_getter, db: WatchDB, stop_event: asyncio.Event)
                     name = w.get("name", "?")
                     try:
                         result = await run_watch(scraper_getter(), w, db)
-                        db.set_state(name, "ok" if not result.get("fehler") else "fehler")
+                        db.set_state(name, "ok", "", {
+                            "angebote": result.get("angebote_gesamt", 0),
+                            "deals": len(result.get("deals", [])),
+                            "median": result.get("median")})
                     except Exception as e:  # Watch darf Scheduler nie killen
                         db.set_state(name, "fehler", str(e))
         except Exception:

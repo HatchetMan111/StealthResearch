@@ -125,6 +125,13 @@ class WatchDB:
              titel TEXT, preis REAL, median REAL, rabatt REAL, grund TEXT, zeit INTEGER)""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS watch_state
             (name TEXT PRIMARY KEY, last_run INTEGER, last_status TEXT, last_error TEXT)""")
+        # Migration für ältere DBs (Jobs-Tabelle: letzter Lauf im Detail)
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(watch_state)").fetchall()}
+        for col, typ in (("last_angebote", "INTEGER DEFAULT 0"),
+                         ("last_deals", "INTEGER DEFAULT 0"),
+                         ("last_median", "REAL")):
+            if col not in cols:
+                self._db.execute(f"ALTER TABLE watch_state ADD COLUMN {col} {typ}")
         self._db.commit()
 
     # -- history --
@@ -175,13 +182,31 @@ class WatchDB:
         row = self._db.execute("SELECT last_run FROM watch_state WHERE name=?", (name,)).fetchone()
         return int(row[0]) if row else 0
 
-    def set_state(self, name: str, status: str, error: str = "") -> None:
+    def set_state(self, name: str, status: str, error: str = "",
+                  summary: dict | None = None) -> None:
+        summary = summary or {}
         self._db.execute(
-            """INSERT INTO watch_state (name, last_run, last_status, last_error) VALUES (?, ?, ?, ?)
+            """INSERT INTO watch_state (name, last_run, last_status, last_error,
+               last_angebote, last_deals, last_median) VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (name) DO UPDATE SET last_run=excluded.last_run,
-               last_status=excluded.last_status, last_error=excluded.last_error""",
-            (name, int(time.time()), status, error[:500]))
+               last_status=excluded.last_status, last_error=excluded.last_error,
+               last_angebote=excluded.last_angebote, last_deals=excluded.last_deals,
+               last_median=excluded.last_median""",
+            (name, int(time.time()), status, error[:500],
+             int(summary.get("angebote", 0) or 0), int(summary.get("deals", 0) or 0),
+             summary.get("median")))
         self._db.commit()
+
+    def get_state(self, name: str) -> dict:
+        row = self._db.execute(
+            "SELECT last_run, last_status, last_error, last_angebote, last_deals, last_median"
+            " FROM watch_state WHERE name=?", (name,)).fetchone()
+        if not row:
+            return {"last_run": 0, "last_status": "nie", "last_error": "",
+                    "last_angebote": 0, "last_deals": 0, "last_median": None}
+        return {"last_run": int(row[0] or 0), "last_status": row[1] or "",
+                "last_error": row[2] or "", "last_angebote": int(row[3] or 0),
+                "last_deals": int(row[4] or 0), "last_median": row[5]}
 
 
 def send_webhook(url: str, payload: dict) -> None:
@@ -189,6 +214,25 @@ def send_webhook(url: str, payload: dict) -> None:
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         r.read(1024)
+
+
+async def preview_search(scraper, search_url: str, provider_key: str = "",
+                         max_preis: float | None = None) -> dict:
+    """Trockenlauf für den Einrichtungs-Assistenten: 1. Seite holen, Treffer +
+    Median zeigen, nichts speichern (kein DB-Schreibzugriff)."""
+    from .providers import PROVIDERS
+    if not provider_key or provider_key == "auto":
+        provider_key, _ = preset_for_url(search_url)
+    preset = PROVIDERS.get(provider_key, PROVIDERS["generisch"])
+    page = await scraper.fetch(search_url)
+    alle = extract_listings(page["html"], search_url, preset, {})
+    angebote = [a for a in alle
+                if max_preis is None or (a.get("preis") is not None and a["preis"] <= max_preis)]
+    median = median_preis(angebote)
+    beispiele = [{"titel": a["titel"], "preis": a["preis"], "url": a["url"]} for a in angebote[:5]]
+    return {"provider_erkannt": provider_key, "angebote_gesamt": len(alle),
+            "mit_preis": len([a for a in angebote if a.get("preis") is not None]),
+            "median": round(median, 2) if median else None, "beispiele": beispiele}
 
 
 async def run_watch(scraper, watch: dict, db: WatchDB) -> dict:

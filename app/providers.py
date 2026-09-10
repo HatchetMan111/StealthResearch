@@ -10,12 +10,16 @@ Neuer Anbieter = neuer Eintrag in PROVIDERS (Name, Domains, Selektoren).
 """
 from __future__ import annotations
 
-from urllib.parse import urlparse
+import re
+import unicodedata
+from urllib.parse import quote_plus, urlparse
 
 PROVIDERS: dict[str, dict] = {
     "kleinanzeigen": {
         "label": "Kleinanzeigen.de",
         "domains": ["kleinanzeigen.de"],
+        "suchlink": "https://www.kleinanzeigen.de/s-{q}/k0",
+        "q_stil": "slug",  # Suchbegriff als Pfad-Slug (deutschlandweit, Kategorie egal)
         "hinweis": ("Im Browser filtern (Suchbegriff, Ort/PLZ + Umkreis z.B. 10 km, "
                     "ggf. Preis, Sortierung 'Neueste zuerst') und die URL kopieren. "
                     "Beispiel: https://www.kleinanzeigen.de/s-laptop/12345-ort/preis::500/c...l...r10"),
@@ -29,6 +33,8 @@ PROVIDERS: dict[str, dict] = {
     "mobile": {
         "label": "Mobile.de",
         "domains": ["mobile.de"],
+        "suchlink": "",
+        "q_stil": "slug",
         "hinweis": "Suche im Browser filtern (PLZ + Umkreis, Preis) und URL kopieren.",
         "item": ["a.result-item", "[data-testid='result-item']", ".cBox-body--resultitem"],
         "titel": ["h3", "[data-testid='result-title']"],
@@ -39,6 +45,8 @@ PROVIDERS: dict[str, dict] = {
     "autoscout": {
         "label": "Autoscout24",
         "domains": ["autoscout24.de"],
+        "suchlink": "",
+        "q_stil": "slug",
         "hinweis": "Suche im Browser filtern (PLZ + Umkreis, Preis) und URL kopieren.",
         "item": ["article.cldt-summary-full-item", "[data-testid='list-item']"],
         "titel": ["h2", "[data-testid='vehicle-title']"],
@@ -49,6 +57,8 @@ PROVIDERS: dict[str, dict] = {
     "ebay": {
         "label": "eBay.de",
         "domains": ["ebay.de"],
+        "suchlink": "https://www.ebay.de/sch/i.html?_nkw={q}",
+        "q_stil": "param",
         "hinweis": "Suche im Browser filtern und URL kopieren.",
         "item": ["li.s-card", ".s-item", "[data-testid='s-card']"],
         "titel": [".s-card__title", ".s-item__title"],
@@ -59,6 +69,8 @@ PROVIDERS: dict[str, dict] = {
     "idealo": {
         "label": "Idealo (Preisvergleich)",
         "domains": ["idealo.de"],
+        "suchlink": "https://www.idealo.de/preisvergleich/MainSearchProductCategoryFull.html?q={q}",
+        "q_stil": "param",
         "hinweis": "Produktseite oder Suche kopieren. Gut für 'unter Median'-Vergleiche über Händler.",
         "item": [".productList-item", "[data-testid='product-card']", ".offerList-item"],
         "titel": [".productList-title", "[data-testid='product-title']"],
@@ -69,6 +81,8 @@ PROVIDERS: dict[str, dict] = {
     "generisch": {
         "label": "Generisch (eigene Selektoren)",
         "domains": [],
+        "suchlink": "",
+        "q_stil": "slug",
         "hinweis": "Für jeden anderen Shop: URL kopieren + Selektoren in der Watch eintragen.",
         "item": ["article", ".product", ".item", "li"],
         "titel": ["h2", "h3", ".title"],
@@ -103,3 +117,24 @@ def select_first(soup, candidates: list[str]):
         if el:
             return el
     return None
+
+
+_UMLAUTE = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"})
+
+
+def slugify(query: str) -> str:
+    """Suchbegriff -> URL-Slug ('ThinkPad T14' -> 'thinkpad-t14')."""
+    q = (query or "").lower().translate(_UMLAUTE)  # erst Umlaute, dann Rest zerlegen
+    q = "".join(c for c in unicodedata.normalize("NFKD", q) if not unicodedata.combining(c))
+    q = re.sub(r"[^a-z0-9]+", "-", q).strip("-")
+    return re.sub(r"-{2,}", "-", q)
+
+
+def quick_search_url(provider_key: str, query: str) -> str:
+    """Vorgefüllte Suche öffnen (Schritt 1 im Assistenten). '' = manuell nötig."""
+    p = PROVIDERS.get(provider_key or "", {})
+    tpl = p.get("suchlink", "")
+    if not tpl or not (query or "").strip():
+        return ""
+    q = slugify(query) if p.get("q_stil") == "slug" else quote_plus(query.strip())
+    return tpl.replace("{q}", q) if q else ""

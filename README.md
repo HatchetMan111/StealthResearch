@@ -67,17 +67,20 @@ Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Rese
 
 ## Schnäppchen-Watcher (Kleinanzeigen & Co.)
 
-Prinzip — für **alle Anbieter gleich**:
+Prinzip — für **alle Anbieter gleich**. Dashboard Sektion 4 führt in 3 Schritten:
 
-1. Im Browser filtern: Suchbegriff, **PLZ + Umkreis** (z.B. 10 km), ggf. Preis,
-   Sortierung „Neueste zuerst“.
-2. Die fertige **Such-URL kopieren** und als Watch anlegen (Dashboard Sektion 4
-   oder API `/watches`).
-3. Das System prüft die URL automatisch im eingestellten **Abstand pro Watch**
-   (`interval_minutes`, Minimum 15 — Bot-Schutz!), sammelt die Treffer,
-   berechnet den **Median** und meldet Inserate **X % darunter als Deal**
-   (`UNTER_MARKT`) sowie deutliche **Preissenkungen** (`PREISSENKUNG`).
-4. Optional: `notify_webhook` (z.B. ntfy/Discord) bekommt neue Deals als POST.
+1. **Anbieter + Suchbegriff** wählen → „Suche im Browser öffnen“ (vorgefüllt).
+2. Dort **PLZ + Umkreis** (z.B. 10 km), Preis und „Neueste zuerst“ wählen,
+   **URL kopieren** und einfügen → **„URL testen“** zeigt sofort Treffer +
+   Median (nichts wird gespeichert).
+3. **Abstand wählen** (Buttons: 15 Min – täglich, Minimum 15 Min Bot-Schutz),
+   optional Max-Preis/Webhook → **speichern & einplanen**.
+
+Das System prüft jede Suche automatisch im Intervall, berechnet den **Median**
+und meldet Inserate **X % darunter als Deal** (`UNTER_MARKT`) sowie deutliche
+**Preissenkungen** (`PREISSENKUNG`). Die **Jobs-Tabelle** zeigt pro Suche:
+Intervall, letzter Lauf, **nächster geplanter Lauf**, Ergebnis (Angebote,
+Median, Deals) und Status — mit Aktionen (Jetzt prüfen, Pausieren, Löschen).
 
 Vorkonfiguriert: `kleinanzeigen`, `mobile`, `autoscout`, `ebay`, `idealo`,
 `generisch` (eigene Selektoren). Neuer Anbieter = 10 Zeilen in

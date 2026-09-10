@@ -14,10 +14,10 @@ from pydantic import BaseModel, Field
 from .cache import TTLCache
 from .config import load_config, resolve_config_path, save_config
 from .parser import auto_price, extract_with_selectors
-from .providers import PROVIDERS, preset_for_url
-from .scheduler import due_watches, scheduler_loop
+from .providers import PROVIDERS, preset_for_url, quick_search_url
+from .scheduler import due_watches, next_run_ts, scheduler_loop
 from .scraper import Scraper
-from .watcher import MIN_INTERVAL_MINUTES, WatchDB, run_watch
+from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_watch
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
@@ -100,7 +100,7 @@ async def providers_list(x_token: str | None = Header(default=None)):
     _auth(x_token)
     return JSONResponse([
         {"key": k, "label": v.get("label"), "domains": v.get("domains", []),
-         "hinweis": v.get("hinweis", "")}
+         "hinweis": v.get("hinweis", ""), "suchlink": v.get("suchlink", "")}
         for k, v in PROVIDERS.items()
     ])
 
@@ -164,13 +164,18 @@ def _validate_watch(data: dict) -> dict:
 async def watches_list(x_token: str | None = Header(default=None)):
     _auth(x_token)
     cfg = _fresh_cfg()
+    now = int(time.time())
     out = []
     for w in cfg.get("watches", []) or []:
         d = dict(w)
-        d["last_run"] = WDB.last_run(w.get("name", ""))
-        st = WDB._db.execute("SELECT last_status, last_error FROM watch_state WHERE name=?",
-                             (w.get("name", ""),)).fetchone()
-        d["last_status"], d["last_error"] = (st or ("nie", ""))
+        st = WDB.get_state(w.get("name", ""))
+        d["last_run"] = st["last_run"]
+        d["last_status"] = st["last_status"]
+        d["last_error"] = st["last_error"]
+        d["summary"] = {"angebote": st["last_angebote"], "deals": st["last_deals"],
+                        "median": st["last_median"]}
+        d["next_run"] = next_run_ts(w, st["last_run"], now) if w.get("enabled") else None
+        d["due"] = bool(w.get("enabled")) and d["next_run"] is not None and d["next_run"] <= now
         out.append(d)
     return JSONResponse(out)
 
@@ -223,7 +228,10 @@ async def watch_run(name: str, x_token: str | None = Header(default=None)):
         raise HTTPException(status_code=404, detail="Watch nicht gefunden")
     try:
         result = await run_watch(SCRAPER, watch, WDB)
-        WDB.set_state(name, "ok")
+        WDB.set_state(name, "ok", "", {
+            "angebote": result.get("angebote_gesamt", 0),
+            "deals": len(result.get("deals", [])),
+            "median": result.get("median")})
     except Exception as e:
         WDB.set_state(name, "fehler", str(e))
         raise HTTPException(status_code=502, detail=f"Watch fehlgeschlagen: {e}")
@@ -235,6 +243,37 @@ async def deals_list(watch: str | None = None, limit: int = 50,
                      x_token: str | None = Header(default=None)):
     _auth(x_token)
     return JSONResponse(WDB.deals(watch or None, max(1, min(limit, 200))))
+
+
+class PreviewReq(BaseModel):
+    search_url: str = ""
+    provider: str = "auto"
+    max_preis: float | None = None
+
+
+@app.post("/watches/preview")
+async def watch_preview(req: PreviewReq, x_token: str | None = Header(default=None)):
+    """URL-Test im Einrichtungs-Assistenten: zeigt Treffer + Median, ohne zu speichern."""
+    _auth(x_token)
+    url = (req.search_url or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="search_url muss mit http(s):// beginnen")
+    try:
+        mp = float(req.max_preis) if req.max_preis not in (None, "") else None
+    except (TypeError, ValueError):
+        mp = None
+    try:
+        return JSONResponse(await preview_search(SCRAPER, url, req.provider or "auto", mp))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Vorschau fehlgeschlagen: {e}")
+
+
+@app.post("/watches/quicklink")
+async def watch_quicklink(payload: dict, x_token: str | None = Header(default=None)):
+    """Vorgefüllte Anbieter-Suche für Schritt 1 ('Suche öffnen')."""
+    _auth(x_token)
+    url = quick_search_url((payload or {}).get("provider", ""), (payload or {}).get("query", ""))
+    return {"url": url}
 
 
 # ---------- Einstellungen: alles über Web UI (wie BraveResearch /settings) ----------
@@ -386,6 +425,10 @@ th{background:#222;color:#bbb}pre{background:#0d0d0d;padding:.7em;overflow:auto;
 .ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#999;font-size:.85em}
 a{color:#7fdc7f}
 .badge{display:inline-block;background:#1b5e20;border-radius:10px;padding:.1em .6em;font-size:.85em}
+.pill{border-radius:14px !important;padding:.4em .9em !important}
+.pill.on{background:#1b5e20 !important;border:1px solid #7fdc7f !important}
+#toast{position:sticky;top:.5em;z-index:10;font-weight:bold}
+details{margin-top:.6em}summary{cursor:pointer;color:#bbb}
 @media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}}
 </style></head><body>
 <h1>StealthScraper-LXC</h1>
@@ -432,32 +475,53 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <button id="b_tlist" class="sec">Targets laden</button></div>
 <div id="tlist"></div></details></div>
 
-<div class="card"><h3>4. Schn&auml;ppchen-Watcher</h3>
-<p class="mut">Im Browser filtern (Suchbegriff, PLZ + Umkreis, Preis, &bdquo;Neueste zuerst&ldquo;),
-die fertige <b>Such-URL kopieren</b> und hier als Watch anlegen. Das System pr&uuml;ft sie
-automatisch im eingestellten Abstand, vergleicht jeden Fund mit dem Median und meldet
-unterbewertete Treffer als Deal. Gleiches Prinzip f&uuml;r alle Anbieter.</p>
+<div class="card"><h3>4. Schn&auml;ppchen-Watcher <span id="health" class="mut"></span></h3>
+<div id="toast"></div>
+<details open><summary><b>Neue Suche anlegen (Assistent)</b></summary>
+<p class="mut"><b>Schritt 1:</b> Anbieter + Suchbegriff w&auml;hlen und Suche &ouml;ffnen.
+<b>Schritt 2:</b> Dort PLZ + Umkreis + Preis filtern, URL kopieren und unten einf&uuml;gen.
+<b>Schritt 3:</b> Testen, Abstand w&auml;hlen, speichern &mdash; fertig.</p>
 <div class="grid">
-<div><label>Name</label><input id="w_name" type="text" placeholder="thinkpad-umkreis"></div>
-<div><label>Anbieter</label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select></div>
+<div><label>1. Anbieter</label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select>
+<div class="mut" id="w_phinweis"></div></div>
+<div><label>Suchbegriff</label><input id="w_query" type="text" placeholder="z.B. ThinkPad T14">
+<div><button id="b_quick" class="sec">Suche im Browser &ouml;ffnen</button></div></div>
 </div>
-<label>Such-URL (aus dem Browser kopiert)</label>
+<label>2. Kopierte Such-URL hier einf&uuml;gen</label>
 <input id="w_url" type="text" placeholder="https://www.kleinanzeigen.de/s-laptop/...">
+<div><button id="b_preview" class="sec">URL testen (Treffer + Median anzeigen)</button></div>
+<div id="preview"></div>
 <div class="grid3">
-<div><label>Suchbegriff (Doku)</label><input id="w_query" type="text" placeholder="ThinkPad T14"></div>
-<div><label>PLZ (Doku)</label><input id="w_plz" type="text" placeholder="10115"></div>
-<div><label>Umkreis km (Doku)</label><input id="w_radius" type="number" value="10" min="0" max="200"></div>
+<div><label>Name (Vorschlag aus Suchbegriff)</label><input id="w_name" type="text" placeholder="thinkpad-t14"></div>
+<div><label>PLZ (Merkfeld)</label><input id="w_plz" type="text" placeholder="10115"></div>
 <div><label>Max-Preis &euro; (Filter)</label><input id="w_maxpreis" type="number" placeholder="500" min="0"></div>
-<div><label>Deal-Schwelle % unter Median</label><input id="w_schwelle" type="number" value="25" min="1" max="90"></div>
-<div><label>Pr&uuml;f-Abstand (Minuten, min. 15)</label><input id="w_interval" type="number" value="60" min="15"></div>
 </div>
-<label>Webhook f&uuml;r Deal-Meldungen (optional, POST als JSON)</label>
+<label>Umkreis (Merkfeld, steckt in der kopierten URL)</label>
+<div id="r_pills">
+<button class="sec pill" data-v="5">5 km</button><button class="sec pill on" data-v="10">10 km</button><button class="sec pill" data-v="20">20 km</button><button class="sec pill" data-v="30">30 km</button><button class="sec pill" data-v="50">50 km</button><button class="sec pill" data-v="100">100 km</button>
+</div>
+<label>Deal-Schwelle: <b><span id="schw_val">25</span> %</b> unter Median</label>
+<input id="w_schwelle_r" type="range" min="5" max="70" value="25" style="width:100%">
+<label>3. Wie oft pr&uuml;fen? (Minimum 15 Min &mdash; Bot-Schutz)</label>
+<div id="i_pills">
+<button class="sec pill" data-v="15">alle 15 Min</button><button class="sec pill" data-v="30">alle 30 Min</button><button class="sec pill on" data-v="60">st&uuml;ndlich</button><button class="sec pill" data-v="360">alle 6 Std</button><button class="sec pill" data-v="1440">t&auml;glich</button>
+</div>
+<input id="w_interval" type="hidden" value="60">
+<details><summary>Erweitert: Webhook + eigene Selektoren</summary>
+<label>Webhook f&uuml;r Deal-Meldungen (optional)</label>
 <input id="w_hook" type="text" placeholder="https://ntfy.sh/mein-topic oder Discord-Webhook">
-<label><input id="w_enabled" type="checkbox" checked> Aktiviert</label>
-<div><button id="b_wsave">Watch speichern</button>
-<button id="b_watches" class="sec">Watches laden</button>
+<label>Eigene Selektoren (je Zeile <i>feld=css</i>, &uuml;berschreibt Preset)</label>
+<textarea id="w_sel" rows="2" placeholder="preis=.mein-preis"></textarea>
+</details>
+<label><input id="w_enabled" type="checkbox" checked> Aktiviert (pausiert = kein automatischer Lauf)</label>
+<div><button id="b_wsave">Watch speichern &amp; einplanen</button></div>
+</details>
+<h3>Geplante &amp; gelaufene Jobs</h3>
+<div><button id="b_watches" class="sec">Aktualisieren</button>
 <button id="b_deals" class="sec">Deals laden</button></div>
-<div id="watches"></div><div id="deals"></div></div>
+<div id="watches"></div>
+<h3>Gefundene Deals <select id="deal_filter" style="width:auto"><option value="">alle Watches</option></select></h3>
+<div id="deals"></div></div>
 
 <div class="card mut">API: <code>POST /scrape</code> &middot; <code>POST /price</code> &middot;
 <code>POST /targets/check</code> &middot; <code>GET /watches</code> &middot;
@@ -517,40 +581,81 @@ async function delTarget(n){if(!confirm('Target \\''+n+'\\' löschen?'))return;
 try{await fetch('/targets/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadTargets();}catch(e){alert('Fehler: '+e.message);}}
 $('b_tlist').onclick=loadTargets;loadTargets();
 async function loadProviders(){try{const r=await fetch('/providers',tokQ());const d=await r.json();
-const s=$('w_provider');d.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=p.label;if(p.key==='generisch')o.textContent+=' (alle anderen Shops)';s.appendChild(o);});}catch(e){}}
+PROV=d;const s=$('w_provider');d.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=p.label;if(p.key==='generisch')o.textContent+=' (alle anderen Shops)';s.appendChild(o);});updPhinweis();}catch(e){}}
+let PROV=[];
+function updPhinweis(){const p=(PROV||[]).find(x=>x.key===$('w_provider').value);
+$('w_phinweis').textContent=p&&p.hinweis?p.hinweis:'';
+$('b_quick').style.display=(p&&p.suchlink)?'':'none';}
+$('w_provider').onchange=updPhinweis;
+$('w_query').oninput=e=>{if(!$('w_name').value.trim())$('w_name').value=e.target.value.toLowerCase().replace(/[äÄ]/g,'ae').replace(/[öÖ]/g,'oe').replace(/[üÜ]/g,'ue').replace(/ß/g,'ss').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);};
+function pillInit(id,hidden){const box=$(id);box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');$(hidden).value=b.dataset.v;};});}
+pillInit('r_pills');pillInit('i_pills');
+$('w_schwelle_r').oninput=e=>{$('schw_val').textContent=e.target.value;};
+function toast(m,err){const t=$('toast');t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',5000);}
+function radiusVal(){const b=document.querySelector('#r_pills .pill.on');return b?parseInt(b.dataset.v):10;}
+$('b_quick').onclick=async()=>{const q=$('w_query').value.trim();if(!q){toast('Erst Suchbegriff eingeben',1);return;}
+try{const r=await fetch('/watches/quicklink',{method:'POST',headers:hdr(),body:JSON.stringify({provider:$('w_provider').value,query:q})});
+const d=await r.json();if(!d.url){toast('Für diesen Anbieter: Suche manuell öffnen (komplexe Filter)',1);return;}
+window.open(d.url,'_blank');toast('Suche geöffnet: dort PLZ + Umkreis + Preis wählen, URL kopieren');}catch(e){toast('Fehler: '+e.message,1);}};
+$('b_preview').onclick=async()=>{const u=$('w_url').value.trim();if(!u){toast('Erst Such-URL einfügen',1);return;}
+$('preview').innerHTML='<span class="mut">Teste URL &hellip; (dauert ca. 10&ndash;20 s)</span>';
+try{const mp=$('w_maxpreis').value.trim();
+const body={search_url:u,provider:$('w_provider').value};if(mp)body.max_preis=parseFloat(mp);
+const r=await fetch('/watches/preview',{method:'POST',headers:hdr(),body:JSON.stringify(body)});
+const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
+let h='<p>'+d.angebote_gesamt+' Treffer, '+d.mit_preis+' mit Preis, Median <b>'+(d.median??'&ndash;')+' &euro;</b> <span class="mut">('+esc(d.provider_erkannt)+')</span></p>';
+if(d.beispiele&&d.beispiele.length){h+='<table><tr><th>Beispiel</th><th>Preis</th></tr>';
+d.beispiele.forEach(b=>{h+='<tr><td>'+esc(b.titel||b.url)+'</td><td>'+(b.preis??'&ndash;')+' &euro;</td></tr>';});h+='</table>';}
+else h+='<p class="err">Keine Treffer erkannt &mdash; URL oder Selektoren prüfen.</p>';
+$('preview').innerHTML=h;}catch(e){$('preview').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}};
 function wBody(){const v=id=>$(id).value.trim();
+const sel={};$('w_sel').value.split('\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),vv=l.slice(i+1).trim();if(k&&vv)sel[k]=vv;}});
 const b={name:v('w_name'),enabled:$('w_enabled').checked,provider:$('w_provider').value,search_url:v('w_url'),
-query:v('w_query'),plz:v('w_plz'),radius_km:parseInt(v('w_radius'))||10,
-deal_schwelle_prozent:parseFloat(v('w_schwelle'))||25,interval_minutes:parseInt(v('w_interval'))||60,
-notify_webhook:v('w_hook')};const mp=v('w_maxpreis');if(mp)b.max_preis=parseFloat(mp);return b;}
-$('b_wsave').onclick=async()=>{const b=wBody();if(!b.name||!b.search_url){alert('Name und Such-URL ausfüllen');return;}
+query:v('w_query'),plz:v('w_plz'),radius_km:radiusVal(),
+deal_schwelle_prozent:parseInt($('w_schwelle_r').value)||25,interval_minutes:parseInt($('w_interval').value)||60,
+notify_webhook:v('w_hook'),selectors:sel};const mp=v('w_maxpreis');if(mp)b.max_preis=parseFloat(mp);return b;}
+$('b_wsave').onclick=async()=>{const b=wBody();if(!b.name||!b.search_url){toast('Name und Such-URL ausfüllen',1);return;}
 try{const r=await fetch('/watches',{method:'POST',headers:hdr(),body:JSON.stringify(b)});const d=await r.json();
-if(!r.ok)throw new Error(d.detail||r.status);alert('Watch gespeichert (Prüf-Abstand: '+d.interval_minutes+' Min)');loadWatches();}catch(e){alert('Fehler: '+e.message);}};
+if(!r.ok)throw new Error(d.detail||r.status);toast('Gespeichert: '+d.name+' (alle '+d.interval_minutes+' Min)');loadWatches();}catch(e){toast('Fehler: '+e.message,1);}};
+function fmtT(ts){return ts?new Date(ts*1000).toLocaleString('de-DE'):'nie';}
+function fmtIn(ts){if(!ts)return'&ndash;';const s=ts-Math.floor(Date.now()/1000);if(s<=0)return'<b>f&auml;llig</b>';if(s<3600)return'in '+Math.ceil(s/60)+' Min';if(s<86400)return'in '+(s/3600).toFixed(1)+' Std';return'in '+Math.round(s/86400)+' Tg';}
 async function loadWatches(){try{const r=await fetch('/watches',tokQ());const d=await r.json();
-if(!d.length){$('watches').innerHTML='<p class="mut">Noch keine Watches.</p>';return;}
-let h='<table><tr><th>Name</th><th>Suche</th><th>Abstand</th><th>Status</th><th>Aktion</th></tr>';
-d.forEach(w=>{const lr=w.last_run?new Date(w.last_run*1000).toLocaleString('de-DE'):'nie';
-h+='<tr><td>'+esc(w.name)+(w.enabled?'':' (pausiert)')+'</td><td>'+esc((w.query||'')+' '+(w.plz||''))+'<br><span class="mut">'+esc(w.search_url.slice(0,60))+'&hellip;</span></td>'
-+'<td>alle '+w.interval_minutes+' Min<br><span class="mut">zuletzt: '+esc(lr)+'</span></td>'
-+'<td>'+esc(w.last_status||'-')+'</td>'
-+'<td><button class="sec" onclick="runWatch(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button> '
+const df=$('deal_filter');const cur=df.value;df.innerHTML='<option value="">alle Watches</option>';
+d.forEach(w=>{const o=document.createElement('option');o.value=w.name;o.textContent=w.name;df.appendChild(o);});df.value=cur;
+if(!d.length){$('watches').innerHTML='<p class="mut">Noch keine Jobs. Lege oben deine erste Suche an.</p>';return;}
+let h='<table><tr><th>Job</th><th>Intervall</th><th>Zuletzt</th><th>N&auml;chster Lauf</th><th>Ergebnis</th><th>Status</th><th>Aktion</th></tr>';
+d.forEach(w=>{const s=w.summary||{};
+const erg=(s.angebote||0)+' Angebote'+(s.median?' &middot; Median '+s.median+' &euro;':'')+' &middot; <b>'+(s.deals||0)+' Deals</b>';
+h+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)</span>')+'<br><span class="mut">'+esc((w.query||'')+' '+(w.plz||'')+(w.radius_km?' +'+w.radius_km+'km':''))+'</span></td>'
++'<td>alle '+w.interval_minutes+' Min</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
++'<td>'+erg+'</td><td>'+(w.last_status==='ok'?'<span class="ok">ok</span>':w.last_status==='nie'?'<span class="mut">wartet</span>':'<span class="err">'+esc(w.last_status)+'</span>')+(w.last_error?'<br><span class="mut">'+esc(w.last_error.slice(0,80))+'</span>':'')+'</td>'
++'<td><button class="sec" onclick="runWatch(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
++'<button class="sec" onclick="toggleWatch(\\''+esc(w.name)+'\\','+(w.enabled?'0':'1')+')">'+(w.enabled?'Pausieren':'Aktivieren')+'</button> '
 +'<button class="warn" onclick="delWatch(\\''+esc(w.name)+'\\')">L&ouml;schen</button></td></tr>';});
 h+='</table>';$('watches').innerHTML=h;}catch(e){$('watches').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
 $('b_watches').onclick=loadWatches;
-async function runWatch(n){try{const r=await fetch('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
+async function toggleWatch(n,en){try{const r=await fetch('/watches',tokQ());const d=await r.json();
+const w=d.find(x=>x.name===n);if(!w)return;w.enabled=!!en;
+const p=await fetch('/watches/'+encodeURIComponent(n),{method:'PUT',headers:hdr(),body:JSON.stringify(w)});
+if(!p.ok){const e=await p.json();throw new Error(e.detail||p.status);}loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
+async function runWatch(n){toast('Prüfe '+n+' …');
+try{const r=await fetch('/watches/'+encodeURIComponent(n)+'/run',{method:'POST',headers:hdr()});
 const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
-alert(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();}catch(e){alert('Fehler: '+e.message);}}
+toast(d.watch+': '+d.angebote_gesamt+' Angebote, Median '+(d.median??'-')+' €, '+d.deals.length+' Deals');loadWatches();loadDeals();}catch(e){toast('Fehler: '+e.message,1);}}
 async function delWatch(n){if(!confirm('Watch \\''+n+'\\' löschen?'))return;
-try{await fetch('/watches/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadWatches();}catch(e){alert('Fehler: '+e.message);}}
-async function loadDeals(){try{const r=await fetch('/deals?limit=50',tokQ());const d=await r.json();
+try{await fetch('/watches/'+encodeURIComponent(n),{method:'DELETE',headers:hdr()});loadWatches();}catch(e){toast('Fehler: '+e.message,1);}}
+async function loadDeals(){const wf=$('deal_filter').value;const q=wf?'?watch='+encodeURIComponent(wf)+'&limit=50':'?limit=50';
+try{const r=await fetch('/deals'+q,tokQ());const d=await r.json();
 if(!d.length){$('deals').innerHTML='<p class="mut">Noch keine Deals gefunden.</p>';return;}
 let h='<table><tr><th>Deal</th><th>Preis</th><th>Median</th><th>Grund</th><th>Wann</th></tr>';
 d.forEach(t=>{h+='<tr><td><a style="color:#7fdc7f" target="_blank" href="'+esc(t.url)+'">'+esc(t.titel||t.url)+'</a><br><span class="mut">'+esc(t.watch)+'</span></td>'
 +'<td>'+esc(t.preis)+' € <span class="badge">-'+esc(t.rabatt)+'%</span></td><td>'+esc(t.median)+' €</td>'
 +'<td>'+esc(t.grund)+'</td><td>'+new Date(t.zeit*1000).toLocaleString('de-DE')+'</td></tr>';});
 h+='</table>';$('deals').innerHTML=h;}catch(e){$('deals').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
-$('b_deals').onclick=loadDeals;
-loadProviders();loadWatches();loadDeals();
+$('b_deals').onclick=loadDeals;$('deal_filter').onchange=loadDeals;
+async function health(){try{const r=await fetch('/health');await r.json();
+$('health').innerHTML='<span class="ok">● bereit</span>';}catch(e){$('health').innerHTML='<span class="err">● offline</span>';}}
+loadProviders();loadWatches();loadDeals();health();setInterval(loadWatches,60000);
 </script></body></html>"""
 
 
