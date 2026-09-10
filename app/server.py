@@ -21,6 +21,7 @@ from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_watch
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
+VERSION = "2026.09.10-ui3"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
 CACHE = TTLCache(CFG.get("cache", {}).get("db_path", "data/cache.db"),
                  CFG.get("cache", {}).get("ttl_hours", 6))
 SCRAPER = Scraper(CFG)
@@ -65,17 +66,18 @@ class PriceReq(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "time": int(time.time())}
+    return {"ok": True, "time": int(time.time()), "version": VERSION}
 
 
 @app.get("/targets")
 async def targets_list(x_token: str | None = Header(default=None)):
     _auth(x_token)
+    cfg = _fresh_cfg()
     return JSONResponse([
         {"name": t.get("name"), "enabled": bool(t.get("enabled")),
          "url": t.get("url"), "wait_for": t.get("wait_for", ""),
          "selectors": t.get("selectors", {})}
-        for t in CFG.get("targets", []) or []
+        for t in cfg.get("targets", []) or []
     ])
 
 
@@ -363,7 +365,7 @@ async def settings_save(payload: dict, x_token: str | None = Header(default=None
     cfg.setdefault("cache", {})["ttl_hours"] = clean["cache"]["ttl_hours"]
     cfg.setdefault("watcher", {})["enabled"] = clean["watcher"]["enabled"]
     save_config(cfg, CONFIG_PATH)
-    _apply_live(cisclean)
+    _apply_live(clean)
     return {"ok": True,
             "restart_needed": clean["scraper"]["headless"] != old_headless,
             "hinweis": ("Headless geändert: 'systemctl restart stealth-scraper.service' nötig."
@@ -411,28 +413,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>StealthScraper-LXC</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:900px;margin:1.5em auto;padding:0 1em;background:#111;color:#eee}
-.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:1em;margin-bottom:1em}
-label{display:block;margin:.5em 0 .2em;color:#bbb;font-size:.9em}
-input[type=text],input[type=number],textarea,select{width:100%;box-sizing:border-box;background:#0d0d0d;color:#eee;border:1px solid #444;border-radius:6px;padding:.5em}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:.5em 1em}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5em 1em}
-button{background:#2e7d32;color:#fff;border:0;border-radius:6px;padding:.6em 1em;margin:.4em .3em .1em 0;cursor:pointer}
-button.sec{background:#333}button.warn{background:#6d4c00}button:disabled{opacity:.5}
-table{border-collapse:collapse;width:100%;margin-top:.5em}
-td,th{border:1px solid #444;padding:.4em .6em;text-align:left;font-size:.9em}
-th{background:#222;color:#bbb}pre{background:#0d0d0d;padding:.7em;overflow:auto;border-radius:6px;font-size:.8em}
-.ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#999;font-size:.85em}
+:root{--bg:#0f1115;--card:#1a1e26;--line:#2c3340;--txt:#e8ecf1;--mut:#9aa4b2;--acc:#4caf7d;--acc-d:#1b5e20;--warn:#8a6d00;--err:#ff8a8a}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:0 auto;padding:1.2em 1em 3em;background:var(--bg);color:var(--txt);line-height:1.45}
+h1{font-size:1.5em;margin:.2em 0;letter-spacing:.3px}
+h1::after{content:"";display:block;height:3px;width:64px;margin-top:.3em;border-radius:2px;background:linear-gradient(90deg,var(--acc),transparent)}
+nav{position:sticky;top:0;background:rgba(15,17,21,.95);padding:.5em 0;z-index:5;border-bottom:1px solid var(--line);margin-bottom:1em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1.1em 1.2em;margin-bottom:1.1em;box-shadow:0 2px 10px rgba(0,0,0,.35)}
+.card h3{margin:.1em 0 .6em;font-size:1.05em}
+label{display:block;margin:.6em 0 .25em;color:var(--mut);font-size:.88em}
+input[type=text],input[type=password],input[type=number],textarea,select{width:100%;background:#0c0e12;color:var(--txt);border:1px solid #3a4353;border-radius:8px;padding:.55em .7em;font-size:.95em}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 2px rgba(76,175,125,.25)}
+input:disabled{opacity:.6}
+input[type=checkbox]{width:auto;accent-color:var(--acc)}
+input[type=range]{accent-color:var(--acc);padding:0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.4em 1em}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4em 1em}
+button{background:#2e7d32;color:#fff;border:1px solid transparent;border-radius:8px;padding:.6em 1.1em;margin:.45em .35em .1em 0;cursor:pointer;font-size:.92em;transition:filter .15s,transform .05s}
+button:hover{filter:brightness(1.15)}button:active{transform:scale(.98)}
+button.sec{background:#2a313d}button.warn{background:#5d4a00}button:disabled{opacity:.5;cursor:wait}
+table{border-collapse:collapse;width:100%;margin-top:.6em;font-size:.9em}
+div:has(>table){overflow-x:auto}
+td,th{border:1px solid var(--line);padding:.45em .65em;text-align:left;vertical-align:top}
+th{background:#222836;color:var(--mut);white-space:nowrap}
+tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+pre{background:#0c0e12;padding:.7em;overflow:auto;border-radius:8px;font-size:.8em;border:1px solid var(--line)}
+.ok{color:#7fdc7f}.err{color:var(--err)}.mut{color:var(--mut);font-size:.85em}
 a{color:#7fdc7f}
-.badge{display:inline-block;background:#1b5e20;border-radius:10px;padding:.1em .6em;font-size:.85em}
-.pill{border-radius:14px !important;padding:.4em .9em !important}
-.pill.on{background:#1b5e20 !important;border:1px solid #7fdc7f !important}
-#toast{position:sticky;top:.5em;z-index:10;font-weight:bold}
-details{margin-top:.6em}summary{cursor:pointer;color:#bbb}
+.badge{display:inline-block;background:var(--acc-d);border-radius:10px;padding:.1em .6em;font-size:.85em;white-space:nowrap}
+.pill{border-radius:16px !important;padding:.42em .95em !important;background:#2a313d !important}
+.pill.on{background:var(--acc-d) !important;border:1px solid var(--acc) !important}
+#toast{position:sticky;top:3em;z-index:10;font-weight:bold}
+#toast span{display:inline-block;background:#222836;border:1px solid var(--line);border-radius:8px;padding:.5em .9em;margin-bottom:.5em}
+details{margin-top:.7em}summary{cursor:pointer;color:var(--mut);padding:.2em 0}
+code{background:#0c0e12;padding:.1em .4em;border-radius:4px;font-size:.88em}
+@media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}body{padding:1em .7em 3em}}
 @media(max-width:700px){.grid,.grid3{grid-template-columns:1fr}}
 </style></head><body>
 <h1>StealthScraper-LXC</h1>
-<p><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></p>
+<nav><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></nav>
 
 <div class="card"><h3>1. Seite pr&uuml;fen</h3>
 <label>URL</label>
@@ -523,7 +542,7 @@ Selektoren &uuml;berschreiben/erg&auml;nzen die Auto-Erkennung.</p>
 <h3>Gefundene Deals <select id="deal_filter" style="width:auto"><option value="">alle Watches</option></select></h3>
 <div id="deals"></div></div>
 
-<div class="card mut">API: <code>POST /scrape</code> &middot; <code>POST /price</code> &middot;
+<div class="card mut">StealthScraper-LXC <span id="build"></span> &middot; API: <code>POST /scrape</code> &middot; <code>POST /price</code> &middot;
 <code>POST /targets/check</code> &middot; <code>GET /watches</code> &middot;
 <code>POST /watches</code> &middot; <code>POST /watches/{name}/run</code> &middot;
 <code>GET /deals</code> &middot; <code>GET /providers</code> &middot;
@@ -587,9 +606,9 @@ function updPhinweis(){const p=(PROV||[]).find(x=>x.key===$('w_provider').value)
 $('w_phinweis').textContent=p&&p.hinweis?p.hinweis:'';
 $('b_quick').style.display=(p&&p.suchlink)?'':'none';}
 $('w_provider').onchange=updPhinweis;
-$('w_query').oninput=e=>{if(!$('w_name').value.trim())$('w_name').value=e.target.value.toLowerCase().replace(/[äÄ]/g,'ae').replace(/[öÖ]/g,'oe').replace(/[üÜ]/g,'ue').replace(/ß/g,'ss').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);};
-function pillInit(id,hidden){const box=$(id);box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');$(hidden).value=b.dataset.v;};});}
-pillInit('r_pills');pillInit('i_pills');
+$('w_query').oninput=e=>{if(!$('w_name').value.trim())$('w_name').value=slug(e.target.value);};
+function pillInit(id,hidden){const box=$(id);if(!box)return;box.querySelectorAll('.pill').forEach(b=>{b.onclick=()=>{box.querySelectorAll('.pill').forEach(x=>x.classList.remove('on'));b.classList.add('on');if(hidden&&$(hidden))$(hidden).value=b.dataset.v;};});}
+pillInit('r_pills');pillInit('i_pills','w_interval');
 $('w_schwelle_r').oninput=e=>{$('schw_val').textContent=e.target.value;};
 function toast(m,err){const t=$('toast');t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',5000);}
 function radiusVal(){const b=document.querySelector('#r_pills .pill.on');return b?parseInt(b.dataset.v):10;}
@@ -608,9 +627,10 @@ if(d.beispiele&&d.beispiele.length){h+='<table><tr><th>Beispiel</th><th>Preis</t
 d.beispiele.forEach(b=>{h+='<tr><td>'+esc(b.titel||b.url)+'</td><td>'+(b.preis??'&ndash;')+' &euro;</td></tr>';});h+='</table>';}
 else h+='<p class="err">Keine Treffer erkannt &mdash; URL oder Selektoren prüfen.</p>';
 $('preview').innerHTML=h;}catch(e){$('preview').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}};
+function slug(s){return (s||'').toLowerCase().replace(/[äÄ]/g,'ae').replace(/[öÖ]/g,'oe').replace(/[üÜ]/g,'ue').replace(/ß/g,'ss').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40);}
 function wBody(){const v=id=>$(id).value.trim();
-const sel={};$('w_sel').value.split('\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),vv=l.slice(i+1).trim();if(k&&vv)sel[k]=vv;}});
-const b={name:v('w_name'),enabled:$('w_enabled').checked,provider:$('w_provider').value,search_url:v('w_url'),
+const sel={};$('w_sel').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){const k=l.slice(0,i).trim(),vv=l.slice(i+1).trim();if(k&&vv)sel[k]=vv;}});
+const b={name:v('w_name')||slug(v('w_query'))||('watch-'+Date.now().toString(36)),enabled:$('w_enabled').checked,provider:$('w_provider').value,search_url:v('w_url'),
 query:v('w_query'),plz:v('w_plz'),radius_km:radiusVal(),
 deal_schwelle_prozent:parseInt($('w_schwelle_r').value)||25,interval_minutes:parseInt($('w_interval').value)||60,
 notify_webhook:v('w_hook'),selectors:sel};const mp=v('w_maxpreis');if(mp)b.max_preis=parseFloat(mp);return b;}
@@ -653,8 +673,8 @@ d.forEach(t=>{h+='<tr><td><a style="color:#7fdc7f" target="_blank" href="'+esc(t
 +'<td>'+esc(t.grund)+'</td><td>'+new Date(t.zeit*1000).toLocaleString('de-DE')+'</td></tr>';});
 h+='</table>';$('deals').innerHTML=h;}catch(e){$('deals').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
 $('b_deals').onclick=loadDeals;$('deal_filter').onchange=loadDeals;
-async function health(){try{const r=await fetch('/health');await r.json();
-$('health').innerHTML='<span class="ok">● bereit</span>';}catch(e){$('health').innerHTML='<span class="err">● offline</span>';}}
+async function health(){try{const r=await fetch('/health');const d=await r.json();
+$('health').innerHTML='<span class="ok">● bereit</span>';$('build').textContent='· Build '+d.version;}catch(e){$('health').innerHTML='<span class="err">● offline</span>';}}
 loadProviders();loadWatches();loadDeals();health();setInterval(loadWatches,60000);
 </script></body></html>"""
 
@@ -664,18 +684,24 @@ SETTINGS_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Einstellungen &middot; StealthScraper-LXC</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:900px;margin:1.5em auto;padding:0 1em;background:#111;color:#eee}
-.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:1em;margin-bottom:1em}
-label{display:block;margin:.5em 0 .2em;color:#bbb;font-size:.9em}
-input[type=text],input[type=password],input[type=number],textarea{width:100%;box-sizing:border-box;background:#0d0d0d;color:#eee;border:1px solid #444;border-radius:6px;padding:.5em}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:.5em 1em}
-button{background:#2e7d32;color:#fff;border:0;border-radius:6px;padding:.6em 1em;margin:.4em .3em .1em 0;cursor:pointer}
-button.sec{background:#333}.ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#999;font-size:.85em}
+body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:0 auto;padding:1.2em 1em 3em;background:#0f1115;color:#e8ecf1;line-height:1.45}
+h1{font-size:1.5em;margin:.2em 0}
+nav{position:sticky;top:0;background:rgba(15,17,21,.95);padding:.5em 0;z-index:5;border-bottom:1px solid #2c3340;margin-bottom:1em}
+.card{background:#1a1e26;border:1px solid #2c3340;border-radius:12px;padding:1.1em 1.2em;margin-bottom:1.1em;box-shadow:0 2px 10px rgba(0,0,0,.35)}
+.card h3{margin:.1em 0 .6em;font-size:1.05em}
+label{display:block;margin:.6em 0 .25em;color:#9aa4b2;font-size:.88em}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;box-sizing:border-box;background:#0c0e12;color:#e8ecf1;border:1px solid #3a4353;border-radius:8px;padding:.55em .7em;font-size:.95em}
+input:focus{outline:none;border-color:#4caf7d;box-shadow:0 0 0 2px rgba(76,175,125,.25)}
+input[type=checkbox]{width:auto;accent-color:#4caf7d}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.4em 1em}
+button{background:#2e7d32;color:#fff;border:1px solid transparent;border-radius:8px;padding:.6em 1.1em;margin:.45em .35em .1em 0;cursor:pointer;font-size:.92em}
+button:hover{filter:brightness(1.15)}button.sec{background:#2a313d}
+.ok{color:#7fdc7f}.err{color:#ff8a8a}.mut{color:#9aa4b2;font-size:.85em}
 a{color:#7fdc7f}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style></head><body>
 <h1>Einstellungen</h1>
-<p><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></p>
+<nav><a href="/">Start</a> &middot; <a href="/settings">Einstellungen</a></nav>
 <div id="msg"></div>
 <div class="card"><h3>Server</h3>
 <div class="grid">
@@ -794,7 +820,7 @@ async def price(req: PriceReq, x_token: str | None = Header(default=None)):
 async def targets_check(x_token: str | None = Header(default=None)):
     _auth(x_token)
     out = []
-    for t in CFG.get("targets", []) or []:
+    for t in _fresh_cfg().get("targets", []) or []:
         if not t.get("enabled"):
             continue
         try:

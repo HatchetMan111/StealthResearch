@@ -1,0 +1,110 @@
+"""End-to-End: Watch-CRUD + Preview + Run + Jobs-Tabelle + Deals mit Stub-Scraper."""
+import asyncio
+import json
+import sys
+
+sys.path.insert(0, ".")
+
+HTML = """<html><body><ul>
+<li class="ad-listitem"><h2><a href="/s-anzeige/a-111111111.htm">ThinkPad T14</a></h2>
+<div class="aditem-main--middle--price-shipping--price">350 €</div></li>
+<li class="ad-listitem"><h2><a href="/s-anzeige/b-222222222.htm">ThinkPad T14s</a></h2>
+<div class="aditem-main--middle--price-shipping--price">500 €</div></li>
+<li class="ad-listitem"><h2><a href="/s-anzeige/c-333333333.htm">ThinkPad T14 G2</a></h2>
+<div class="aditem-main--middle--price-shipping--price">480 €</div></li>
+<li class="ad-listitem"><h2><a href="/s-anzeige/d-444444444.htm">ThinkPad X1</a></h2>
+<div class="aditem-main--middle--price-shipping--price">900 €</div></li>
+<li class="ad-listitem"><h2><a href="/s-anzeige/e-555555555.htm">ThinkPad T15</a></h2>
+<div class="aditem-main--middle--price-shipping--price">520 €</div></li>
+<li class="ad-listitem"><h2><a href="/s-anzeige/f-666666666.htm">ThinkPad P14s</a></h2>
+<div class="aditem-main--middle--price-shipping--price">90 €</div></li>
+</ul></body></html>"""
+
+
+class StubScraper:
+    async def fetch(self, url, wait_for=""):
+        return {"url": url, "html": HTML, "title": "Suche", "status": 200}
+
+
+def run():
+    import tempfile
+    from pathlib import Path
+    import app.server as s
+    from app.server import PreviewReq, WatchReq
+    from app.watcher import WatchDB
+
+    tmp = Path(tempfile.mkdtemp())
+    cfg_path = tmp / "config.yaml"
+    cfg_path.write_text("watcher:\n  db_path: '" + str(tmp / "deals.db") + "'\n", encoding="utf-8")
+    s.CONFIG_PATH = cfg_path
+    s.WDB = WatchDB(str(tmp / "deals.db"))
+    s.SCRAPER = StubScraper()
+
+    def j(resp):
+        return resp if isinstance(resp, dict) else json.loads(resp.body)
+
+    async def flow():
+        # 1. anlegen
+        w = await s.watch_create(WatchReq(name="thinkpad", search_url="https://www.kleinanzeigen.de/s-laptop/x",
+                                          query="ThinkPad", plz="10115", radius_km=10,
+                                          interval_minutes=30), x_token=None)
+        assert j(w)["name"] == "thinkpad" and j(w)["interval_minutes"] == 30, j(w)
+        # 2. duplikat -> 409
+        try:
+            await s.watch_create(WatchReq(name="thinkpad", search_url="https://x.de/"), x_token=None)
+            raise SystemExit("409 fehlt!")
+        except Exception as e:
+            assert getattr(e, "status_code", None) == 409, e
+        # 3. vorschau (trocken, keine deals)
+        p = await s.watch_preview(PreviewReq(search_url="https://www.kleinanzeigen.de/s-laptop/x"), x_token=None)
+        assert j(p)["angebote_gesamt"] == 6 and j(p)["median"] == 490.0, j(p)
+        assert len(j(p)["beispiele"]) == 5
+        assert s.WDB.deals() == []
+        # 4. lauf -> 90€ bei Median 500 = UNTER_MARKT-deal
+        r = await s.watch_run("thinkpad", x_token=None)
+        assert j(r)["median"] == 490.0, j(r)
+        assert len(j(r)["deals"]) == 2 and 90.0 in [d["preis"] for d in j(r)["deals"]], j(r)
+        # 5. jobs-tabelle: summary + next_run
+        wl = await s.watches_list(x_token=None)
+        job = j(wl)[0]
+        assert job["summary"]["angebote"] == 6 and job["summary"]["deals"] == 2, job
+        assert job["next_run"] == job["last_run"] + 1800 and job["due"] is False, job
+        # 6. deals + filter
+        dl = await s.deals_list(watch=None, limit=50, x_token=None)
+        assert len(j(dl)) == 2 and all(d["grund"] == "UNTER_MARKT" for d in j(dl)), j(dl)
+        dl2 = await s.deals_list(watch="thinkpad", limit=50, x_token=None)
+        assert len(j(dl2)) == 2
+        # 7. zweiter lauf -> kein doppel-deal (history)
+        r2 = await s.watch_run("thinkpad", x_token=None)
+        assert j(r2)["deals"] == [], j(r2)
+        # 8. pausieren -> next_run None
+        await s.watch_update("thinkpad", WatchReq(name="thinkpad", search_url="https://www.kleinanzeigen.de/s-laptop/x",
+                                                  enabled=False), x_token=None)
+        wl2 = await s.watches_list(x_token=None)
+        assert j(wl2)[0]["next_run"] is None and j(wl2)[0]["enabled"] is False
+        # 9. settings roundtrip
+        sd = await s.settings_data(x_token=None)
+        assert "scraper" in j(sd) and "watcher" in j(sd)
+        sv = await s.settings_save({"scraper": {"timeout_seconds": 45}, "cache": {"ttl_hours": 2},
+                                    "watcher": {"enabled": True}}, x_token=None)
+        assert j(sv)["ok"] is True and j(sv)["restart_needed"] is False
+        assert s.SCRAPER.timeout == 45000  # _apply_live wirkt sofort
+        import yaml
+        saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        assert saved["scraper"]["timeout_seconds"] == 45 and saved["cache"]["ttl_hours"] == 2
+        # 10. target crud
+        from app.server import TargetReq
+        await s.target_create(TargetReq(name="t1", url="https://shop.example/1"), x_token=None)
+        tl = await s.targets_list(x_token=None)
+        assert len(j(tl)) == 1
+        await s.target_delete("t1", x_token=None)
+        # 11. watch löschen
+        await s.watch_delete("thinkpad", x_token=None)
+        assert j(await s.watches_list(x_token=None)) == []
+        print("E2E_OK")
+
+    asyncio.run(flow())
+
+
+if __name__ == "__main__":
+    run()
