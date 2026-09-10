@@ -130,6 +130,12 @@ class WatchDB:
         self._db.execute("""CREATE TABLE IF NOT EXISTS target_runs
             (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, zeit INTEGER,
              ok INTEGER, titel TEXT, preis TEXT, status INTEGER, fehler TEXT, daten TEXT)""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS price_history
+            (provider TEXT, ext_id TEXT, preis REAL, zeit INTEGER)""")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_ph ON price_history(provider, ext_id, zeit)")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS watch_stats
+            (watch TEXT, zeit INTEGER, median REAL, angebote INTEGER, deals INTEGER)""")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_ws ON watch_stats(watch, zeit)")
         self._db.execute("""CREATE TABLE IF NOT EXISTS watch_state
             (name TEXT PRIMARY KEY, last_run INTEGER, last_status TEXT, last_error TEXT)""")
         # Migration für ältere DBs (Jobs-Tabelle: letzter Lauf im Detail)
@@ -200,10 +206,11 @@ class WatchDB:
 
     def get_snapshot(self, watch: str, limit: int = 100) -> list[dict]:
         rows = self._db.execute(
-            "SELECT titel, preis, preis_text, url, ort, zeit FROM watch_listings"
+            "SELECT ext_id, titel, preis, preis_text, url, ort, zeit FROM watch_listings"
             " WHERE watch=? ORDER BY preis IS NULL, preis LIMIT ?",
             (watch, max(1, min(limit, 200)))).fetchall()
-        return [dict(zip(("titel", "preis", "preis_text", "url", "ort", "zeit"), r)) for r in rows]
+        return [dict(zip(("ext_id", "titel", "preis", "preis_text", "url", "ort", "zeit"), r))
+                for r in rows]
 
     # -- target-runs: verlauf wiederkehrender seite-prüfen-jobs --
     def add_target_run(self, name: str, result: dict, keep: int = 50) -> None:
@@ -236,6 +243,59 @@ class WatchDB:
             (name, max(1, min(limit, 100)))).fetchall()
         return [{"zeit": r[0], "ok": bool(r[1]), "titel": r[2] or "", "preis": r[3] or "",
                  "status": r[4] or 0, "fehler": r[5] or ""} for r in rows]
+
+    # -- preisverlauf: trend pro inserat + median pro suche --
+    def note_price(self, provider: str, ext_id: str, preis: float | None, now: int) -> None:
+        """Preisänderung festhalten (gleicher Preis -> kein neuer Punkt)."""
+        if preis is None:
+            return
+        row = self._db.execute(
+            "SELECT preis FROM price_history WHERE provider=? AND ext_id=?"
+            " ORDER BY zeit DESC LIMIT 1", (provider, ext_id)).fetchone()
+        if row is not None and abs(float(row[0]) - preis) < 0.005:
+            return
+        self._db.execute(
+            "INSERT INTO price_history (provider, ext_id, preis, zeit) VALUES (?, ?, ?, ?)",
+            (provider, ext_id, preis, now))
+        self._db.execute(
+            "DELETE FROM price_history WHERE provider=? AND ext_id=? AND rowid NOT IN"
+            " (SELECT rowid FROM price_history WHERE provider=? AND ext_id=?"
+            "  ORDER BY zeit DESC LIMIT 200)",
+            (provider, ext_id, provider, ext_id))
+        self._db.commit()
+
+    def price_history(self, provider: str, ext_id: str, limit: int = 100) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT zeit, preis FROM price_history WHERE provider=? AND ext_id=?"
+            " ORDER BY zeit ASC LIMIT ?",
+            (provider, ext_id, max(1, min(limit, 200)))).fetchall()
+        return [{"zeit": r[0], "preis": r[1]} for r in rows]
+
+    def price_history_any(self, ext_id: str, limit: int = 100) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT zeit, preis FROM price_history WHERE ext_id=?"
+            " ORDER BY zeit ASC LIMIT ?",
+            (ext_id, max(1, min(limit, 200)))).fetchall()
+        return [{"zeit": r[0], "preis": r[1]} for r in rows]
+
+    def add_watch_stat(self, watch: str, median: float | None, angebote: int,
+                       deals: int, now: int | None = None) -> None:
+        self._db.execute(
+            "INSERT INTO watch_stats (watch, zeit, median, angebote, deals)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (watch, now if now is not None else int(time.time()), median, angebote, deals))
+        self._db.execute(
+            "DELETE FROM watch_stats WHERE watch=? AND rowid NOT IN"
+            " (SELECT rowid FROM watch_stats WHERE watch=? ORDER BY zeit DESC LIMIT 500)",
+            (watch, watch))
+        self._db.commit()
+
+    def median_history(self, watch: str, limit: int = 100) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT zeit, median, angebote FROM watch_stats WHERE watch=? AND median IS NOT NULL"
+            " ORDER BY zeit ASC LIMIT ?",
+            (watch, max(1, min(limit, 200)))).fetchall()
+        return [{"zeit": r[0], "median": r[1], "angebote": r[2]} for r in rows]
 
     # -- state --
     def last_run(self, name: str) -> int:
@@ -297,6 +357,29 @@ async def preview_search(scraper, search_url: str, provider_key: str = "",
             "median": round(median, 2) if median else None, "beispiele": beispiele}
 
 
+def trend(points: list) -> tuple[str, str, float]:
+    """Trend aus Verlaufspunkten [(zeit, wert)] (ältere vs. neuere Hälfte).
+
+    Gibt (pfeil, text, prozent) zurück: ▼ fallend / ▲ steigend / ─ stabil.
+    Schwelle: ±3 % (Kleinschwankungen zählen nicht als Trend).
+    """
+    vals = [float(v) for _, v in points if v not in (None, "")]
+    vals = [v for v in vals if v > 0]
+    if len(vals) < 2:
+        return ("–", "zu wenig Daten", 0.0)
+    h = max(1, len(vals) // 2)
+    alt = sum(vals[:h]) / h
+    neu = sum(vals[h:]) / (len(vals) - h)
+    if alt <= 0:
+        return ("–", "zu wenig Daten", 0.0)
+    pct = (neu - alt) / alt * 100
+    if pct <= -3:
+        return ("▼", f"fallend ({pct:+.1f} %)", pct)
+    if pct >= 3:
+        return ("▲", f"steigend ({pct:+.1f} %)", pct)
+    return ("─", f"stabil ({pct:+.1f} %)", pct)
+
+
 async def run_watch(scraper, watch: dict, db: WatchDB) -> dict:
     """Eine Watch prüfen: Seiten holen -> Median -> Deals -> History + Webhook."""
     name = watch.get("name", "watch")
@@ -350,8 +433,10 @@ async def run_watch(scraper, watch: dict, db: WatchDB) -> dict:
                                   "rabatt_prozent": round(drop, 1), "grund": "PREISSENKUNG"})
     for ad in angebote:
         db.upsert(provider_key, ad, now)
+        db.note_price(provider_key, ad["ext_id"], ad.get("preis"), now)
     db.commit()
     db.save_snapshot(name, angebote)
+    db.add_watch_stat(name, median, len(angebote), len(deals), now)
 
     if deals and watch.get("notify_webhook"):
         try:

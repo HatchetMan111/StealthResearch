@@ -5,7 +5,7 @@ sys.path.insert(0, ".")
 
 from app.providers import quick_search_url, slugify
 from app.scheduler import next_run_ts
-from app.watcher import WatchDB
+from app.watcher import WatchDB, trend
 
 
 def test_slugify():
@@ -45,3 +45,28 @@ def test_state_summary_roundtrip():
     assert st["last_mitpreis"] == 40
     assert st["last_median"] == 450.5
     assert db.last_run("job1") > 0
+
+
+def test_trend():
+    from app.watcher import trend as tr
+    assert tr([])[0] == "–"
+    assert tr([(1, 100.0)]) == ("–", "zu wenig Daten", 0.0)
+    pfeil, text, pct = tr([(1, 500.0), (2, 480.0), (3, 300.0), (4, 280.0)])
+    assert pfeil == "▼" and pct < -3, (pfeil, text)
+    pfeil, text, pct = tr([(1, 100.0), (2, 110.0), (3, 200.0), (4, 210.0)])
+    assert pfeil == "▲" and pct > 3, (pfeil, text)
+    pfeil, text, pct = tr([(1, 100.0), (2, 101.0), (3, 99.0), (4, 100.0)])
+    assert pfeil == "─", (pfeil, text)
+
+
+def test_price_history():
+    db = WatchDB(":memory:")
+    db.note_price("ka", "123", 500.0, 1000)
+    db.note_price("ka", "123", 500.0, 2000)  # gleich -> kein Punkt
+    db.note_price("ka", "123", 450.0, 3000)
+    hist = db.price_history("ka", "123")
+    assert [p["preis"] for p in hist] == [500.0, 450.0], hist
+    db.add_watch_stat("w", 490.0, 6, 1, now=1000)
+    db.add_watch_stat("w", 470.0, 6, 2, now=2000)
+    mh = db.median_history("w")
+    assert [m["median"] for m in mh] == [490.0, 470.0], mh

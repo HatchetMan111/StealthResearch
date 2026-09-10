@@ -66,7 +66,12 @@ Für Zugriff von außen hinter Reverse-Proxy mit Auth oder VPN — wie beim Rese
 - `/jobs` — **Alle Jobs**: Watches + Targets mit Intervall, letztem/nächstem Lauf,
   Ergebnis, Verlauf (Targets) und Angebots-Unterseite (Watches).
 - `/watch/{name}` — **Angebots-Unterseite**: alle Treffer des letzten Laufs,
-  auch ohne Deal, zum Nachprüfen.
+  auch ohne Deal, zum Nachprüfen. Oben der **Markttrend (Median-Verlauf als
+  Diagramm)**, pro Inserat ein Trend-Pfeil (▼ fallend / ▲ steigend / ─ stabil
+  ab ±3 %) aus seinem Preisverlauf.
+- `/target/{name}` — **Preisverlauf-Seite** für Seite-prüfen-Jobs: Diagramm
+  aller bisherigen Läufe + Verlaufstabelle. Der Verlauf wächst mit jedem
+  Lauf (Targets zeigen dank gespeichertem Verlauf sofort Kurven).
 - `/settings` — Einstellungen: API-Token, Scraper (Timeout, Headless,
   User-Agent, Viewport, Proxy, Bilder blocken), Cache-TTL, Watcher an/aus.
   Speichern wirkt sofort (nur Headless-Umschaltung braucht einen Neustart:

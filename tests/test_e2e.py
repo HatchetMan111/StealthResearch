@@ -125,13 +125,25 @@ def run():
         runs = await s.target_runs("cronjob", limit=5, x_token=None)
         assert len(j(runs)) == 1 and j(runs)[0]["ok"] is True, j(runs)
         await s.target_delete("cronjob", x_token=None)
-        # 10c. watch-unterseite mit snapshot
+        # 10c. watch-unterseite mit snapshot + trend
         await s.watch_create(WatchReq(name="w2", search_url="https://www.kleinanzeigen.de/s-laptop/x"),
                              x_token=None)
         await s.watch_run("w2", x_token=None)
         page = await s.watch_page("w2")
         assert "ThinkPad" in page and "/jobs" in page, page[:200]
+        s.WDB.note_price("kleinanzeigen", "222222222", 400.0, 1000)
+        s.WDB.add_watch_stat("w2", 600.0, 6, 0, now=1000)
+        page2 = await s.watch_page("w2")
+        assert "<svg" in page2 and "Trend" in page2, page2[:300]
         await s.watch_delete("w2", x_token=None)
+        # 10d. target-trendseite (nutzt vorhandenen verlauf)
+        await s.target_create(TargetReq(name="ttrend", url="https://shop.example/1"),
+                              x_token=None)
+        await s.target_run("ttrend", x_token=None)
+        await s.target_run("ttrend", x_token=None)
+        tpage = await s.target_page("ttrend")
+        assert "<svg" in tpage and "Preisverlauf" in tpage, tpage[:300]
+        await s.target_delete("ttrend", x_token=None)
         try:
             await s.watch_page("weg")
             raise SystemExit("404 fehlt!")

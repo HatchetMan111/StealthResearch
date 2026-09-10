@@ -7,6 +7,7 @@ import json
 import time
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
@@ -19,11 +20,11 @@ from .parser import auto_price, extract_with_selectors
 from .providers import PROVIDERS, preset_for_url, quick_search_url
 from .scheduler import due_watches, next_run_ts, scheduler_loop, target_interval
 from .scraper import Scraper
-from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_target, run_watch
+from .watcher import MIN_INTERVAL_MINUTES, WatchDB, preview_search, run_target, run_watch, trend
 
 CONFIG_PATH = resolve_config_path()
 CFG = load_config(CONFIG_PATH)
-VERSION = "2026.09.10-ui5"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
+VERSION = "2026.09.10-ui6"  # im Dashboard-Footer sichtbar (prüfen ob neuer Code läuft)
 CACHE = TTLCache(CFG.get("cache", {}).get("db_path", "data/cache.db"),
                  CFG.get("cache", {}).get("ttl_hours", 6))
 SCRAPER = Scraper(CFG)
@@ -890,8 +891,9 @@ t+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)
 +'<td>'+esc(w.ergebnis)+(w.fehler?'<br><span class="mut">'+esc(w.fehler.slice(0,80))+'</span>':'')+'</td>'
 +'<td>'+(w.status==='ok'?'<span class="ok">ok</span>':'<span class="err">fehler</span>')+'</td>'
 +'<td><button class="sec" onclick="runTarget(\\''+esc(w.name)+'\\')">Jetzt pr&uuml;fen</button><br>'
-+'<button class="sec" onclick="showRuns(\\''+esc(w.name)+'\\')">Verlauf</button> '
-+'<button class="sec" onclick="editTarget(\\''+esc(w.name)+'\\')">Bearbeiten</button><br>'
++'<a target="_blank" href="/target/'+encodeURIComponent(w.name)+'"><button class="sec">Trend</button></a> '
++'<button class="sec" onclick="showRuns(\\''+esc(w.name)+'\\')">Verlauf</button><br>'
++'<button class="sec" onclick="editTarget(\\''+esc(w.name)+'\\')">Bearbeiten</button> '
 +'<button class="warn" onclick="delTarget(\\''+esc(w.name)+'\\')">L&ouml;schen</button></td></tr>';});
 t+='</table>';$('jt').innerHTML=t;}catch(e){$('jw').innerHTML='<span class="err">Fehler: '+esc(e.message)+'</span>';}}
 $('b_reload').onclick=loadJobs;
@@ -930,26 +932,105 @@ SCRAPE_HTML = _page("Seite pr\u00fcfen", "/scrape", SCRAPE_BODY, SCRAPE_JS)
 JOBS_HTML = _page("Jobs", "/jobs", JOBS_BODY, JOBS_JS)
 
 
-def watch_detail_page(name, snapshot):
-    rows = "".join(
+def svg_chart(points, titel=""):
+    """Verlauf als SVG-Liniendiagramm (keine JS-Libs nötig). points: [(zeit, wert)]."""
+    vals = [(t, float(v)) for t, v in points if v not in (None, "")]
+    if len(vals) < 2:
+        return '<p class="mut">Noch zu wenig Daten f\u00fcr einen Verlauf &mdash; w\u00e4chst mit jedem Lauf.</p>'
+    w, h = 620, 150
+    t0, t1 = vals[0][0], vals[-1][0]
+    vmin, vmax = min(v for _, v in vals), max(v for _, v in vals)
+    pad = (vmax - vmin) * 0.15 or abs(vmax) * 0.05 or 1.0
+    lo, hi = vmin - pad, vmax + pad
+
+    def X(t):
+        return 52 + (0 if t1 == t0 else (t - t0) / (t1 - t0)) * (w - 62)
+
+    def Y(v):
+        return h - 22 - (v - lo) / (hi - lo) * (h - 40)
+
+    pts = " ".join(f"{X(t):.1f},{Y(v):.1f}" for t, v in vals)
+    step = max(1, len(vals) // 24)
+    dots = "".join(f'<circle cx="{X(t):.1f}" cy="{Y(v):.1f}" r="2.6" fill="#4caf7d"/>'
+                   for t, v in vals[::step])
+    import time as _t
+    d0 = _t.strftime("%d.%m.", _t.localtime(t0))
+    d1 = _t.strftime("%d.%m.", _t.localtime(t1))
+    return (
+        f'<svg viewBox="0 0 {w} {h}" style="width:100%;height:auto;background:#0c0e12;'
+        f'border:1px solid #2c3340;border-radius:8px" role="img" aria-label="{titel}">'
+        f'<polyline points="{pts}" fill="none" stroke="#4caf7d" stroke-width="2"/>'
+        f"{dots}"
+        f'<text x="4" y="18" fill="#9aa4b2" font-size="11">{vmax:g} \u20ac</text>'
+        f'<text x="4" y="{h - 22}" fill="#9aa4b2" font-size="11">{vmin:g} \u20ac</text>'
+        f'<text x="52" y="{h - 6}" fill="#9aa4b2" font-size="11">{d0}</text>'
+        f'<text x="{w - 52}" y="{h - 6}" fill="#9aa4b2" font-size="11" text-anchor="end">{d1}</text>'
+        f'<text x="{w - 6}" y="18" fill="#e8ecf1" font-size="12" text-anchor="end">{vals[-1][1]:g} \u20ac</text>'
+        "</svg>"
+    )
+
+
+def watch_detail_page(name, snapshot, median_hist, trends):
+    prows = "".join(
         "<tr><td><a target=\"_blank\" href=\"" + html.escape(a.get("url", "")) + "\">" +
         html.escape(a.get("titel") or a.get("url", "")) + "</a></td><td>" +
         html.escape(str(a.get("preis", "")) if a.get("preis") is not None else
                     a.get("preis_text", "")) + " &euro;</td><td>" +
-        html.escape(a.get("ort") or "&ndash;") + "</td></tr>"
+        html.escape(a.get("ort") or "&ndash;") + "</td><td>" +
+        (lambda tr: '<span title="' + html.escape(tr[1]) + '">' + tr[0] + "</span>"
+         if tr[0] != "–" else "<span class=\"mut\">–</span>")(trends.get(a.get("url", ""), ("–", "", 0.0))) +
+        "</td></tr>"
         for a in snapshot
     )
+    mpfeil, mtext, _ = trend([(p["zeit"], p["median"]) for p in median_hist])
     body = ("<div class=\"card\"><h3>Angebote: " + html.escape(name) + "</h3>"
-            "<div id=\"toast\"></div>"
             "<p class=\"mut\">Alle Treffer des letzten Laufs &mdash; auch ohne Deal, zum Nachpr\u00fcfen. "
             "<a href=\"/\">Zur\u00fcck zum Watcher</a> &middot; <a href=\"/jobs\">Alle Jobs</a></p>"
-            + ("<table><tr><th>Angebot</th><th>Preis</th><th>Ort</th></tr>" + rows + "</table>"
+            "<h3>Markttrend (Median aller Treffer): " + mpfeil + " " + html.escape(mtext) + "</h3>"
+            + svg_chart([(p["zeit"], p["median"]) for p in median_hist], "Median-Verlauf")
+            + ("<table><tr><th>Angebot</th><th>Preis</th><th>Ort</th><th>Trend</th></tr>" + prows + "</table>"
                if snapshot else "<p class=\"mut\">Noch keine Angebote gespeichert &mdash; erst „Jetzt pr\u00fcfen“.</p>")
+            + "<p class=\"mut\">Trend je Inserat aus seinem Preisverlauf (Pfeil ab ±3 %). "
+              "Fahre mit der Maus über den Pfeil bzw. tippe ihn an.</p>"
             + "</div><div class=\"card mut\">StealthScraper-LXC</div>")
     return ("<!DOCTYPE html>\n<html lang=\"de\"><head><meta charset=\"utf-8\">\n"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
             "<title>Angebote \u00b7 StealthScraper-LXC</title>\n" + STYLE +
             "</head><body>\n<h1>StealthScraper-LXC</h1>\n" + _nav("/") + "\n" + body +
+            "\n</body></html>")
+
+
+def target_detail_page(name, target, runs):
+    pts = []
+    for r in runs:
+        try:
+            v = float(str(r.get("preis", "")).replace(",", "."))
+            if v > 0:
+                pts.append((r["zeit"], v))
+        except (TypeError, ValueError):
+            continue
+    pts.sort()
+    pfeil, ptext, _ = trend(pts)
+    rrows = "".join(
+        "<tr><td>" + html.escape(datetime.fromtimestamp(r["zeit"]).strftime("%d.%m.%Y %H:%M")) +
+        "</td><td>" + html.escape((r.get("titel") or "")[:60]) + "</td><td>" +
+        html.escape(str(r.get("preis") or "–")) + (" &euro;" if r.get("preis") else "") + "</td><td>" +
+        (str(r.get("status")) if r.get("ok") else '<span class="err">' + html.escape((r.get("fehler") or "fehler")[:80]) + "</span>") +
+        "</td></tr>"
+        for r in runs
+    )
+    body = ("<div class=\"card\"><h3>Preisverlauf: " + html.escape(name) + "</h3>"
+            "<p class=\"mut\">" + html.escape(target.get("url", "")) + "<br>"
+            "<a href=\"/jobs\">Alle Jobs</a> &middot; <a href=\"/scrape\">Seite pr\u00fcfen</a></p>"
+            "<h3>Trend: " + pfeil + " " + html.escape(ptext) + "</h3>"
+            + svg_chart(pts, "Preisverlauf")
+            + ("<table><tr><th>Wann</th><th>Titel</th><th>Preis</th><th>Status</th></tr>" + rrows + "</table>"
+               if runs else "<p class=\"mut\">Noch keine L\u00e4ufe.</p>")
+            + "</div><div class=\"card mut\">StealthScraper-LXC</div>")
+    return ("<!DOCTYPE html>\n<html lang=\"de\"><head><meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<title>Preisverlauf \u00b7 StealthScraper-LXC</title>\n" + STYLE +
+            "</head><body>\n<h1>StealthScraper-LXC</h1>\n" + _nav("/jobs") + "\n" + body +
             "\n</body></html>")
 
 
@@ -1065,7 +1146,21 @@ async def watch_page(name: str):
     cfg = _fresh_cfg()
     if not any(w.get("name") == name for w in (cfg.get("watches", []) or [])):
         raise HTTPException(status_code=404, detail="Watch nicht gefunden")
-    return watch_detail_page(name, WDB.get_snapshot(name, 200))
+    snap = WDB.get_snapshot(name, 200)
+    trends = {}
+    for a in snap:
+        hist = WDB.price_history_any(a.get("ext_id", ""), 100)
+        trends[a.get("url", "")] = trend([(p["zeit"], p["preis"]) for p in hist])
+    return watch_detail_page(name, snap, WDB.median_history(name, 200), trends)
+
+
+@app.get("/target/{name}", response_class=HTMLResponse)
+async def target_page(name: str):
+    cfg = _fresh_cfg()
+    target = next((t for t in (cfg.get("targets", []) or []) if t.get("name") == name), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Target nicht gefunden")
+    return target_detail_page(name, target, WDB.target_runs(name, 100))
 
 
 async def _fetch_cached(url: str, wait_for: str, extra: str, fresh: bool) -> dict:
