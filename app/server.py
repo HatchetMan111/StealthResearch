@@ -187,7 +187,7 @@ async def watches_list(x_token: str | None = Header(default=None)):
         d["last_status"] = st["last_status"]
         d["last_error"] = st["last_error"]
         d["summary"] = {"angebote": st["last_angebote"], "deals": st["last_deals"],
-                        "median": st["last_median"]}
+                        "mit_preis": st["last_mitpreis"], "median": st["last_median"]}
         d["next_run"] = next_run_ts(w, st["last_run"], now) if w.get("enabled") else None
         d["due"] = bool(w.get("enabled")) and d["next_run"] is not None and d["next_run"] <= now
         out.append(d)
@@ -245,6 +245,7 @@ async def watch_run(name: str, x_token: str | None = Header(default=None)):
         WDB.set_state(name, "ok", "", {
             "angebote": result.get("angebote_gesamt", 0),
             "deals": len(result.get("deals", [])),
+            "mit_preis": result.get("mit_preis", 0),
             "median": result.get("median")})
     except HTTPException:
         raise
@@ -484,7 +485,16 @@ async def target_runs(name: str, limit: int = 20,
     return JSONResponse(WDB.target_runs(name, limit))
 
 
-@app.get("/jobs")
+def _watch_ergebnis(st: dict) -> str:
+    """Lesbare Zusammenfassung (nie 'Median None €')."""
+    if not st.get("last_run"):
+        return "noch nie gelaufen"
+    med = f"Median {st['last_median']} €" if st.get("last_median") is not None else "kein Median (zu wenig Preise)"
+    return (f"{st.get('last_angebote', 0)} Treffer · {st.get('last_mitpreis', 0)} mit Preis · "
+            f"{med} · {st.get('last_deals', 0)} Deals")
+
+
+@app.get("/api/jobs")
 async def jobs_list(x_token: str | None = Header(default=None)):
     """Alle Jobs einheitlich: Watches + Targets mit Intervall, Läufen, Ergebnis."""
     _auth(x_token)
@@ -497,9 +507,8 @@ async def jobs_list(x_token: str | None = Header(default=None)):
             "typ": "watch", "name": w.get("name"), "enabled": bool(w.get("enabled")),
             "intervall": f"alle {w.get('interval_minutes', 60)} Min",
             "last_run": st["last_run"], "next_run": next_run_ts(w, st["last_run"], now),
-            "ergebnis": (f"{st['last_angebote']} Angebote · Median {st['last_median']} € · "
-                         f"{st['last_deals']} Deals" if st["last_run"] else "noch nie gelaufen"),
-            "status": st["last_status"], "fehler": st["last_error"],
+            "ergebnis": _watch_ergebnis(st), "status": st["last_status"],
+            "fehler": st["last_error"],
         })
     targets = []
     for t in cfg.get("targets", []) or []:
@@ -569,7 +578,8 @@ const $=id=>document.getElementById(id);
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function hdr(){const h={'Content-Type':'application/json'};const t=localStorage.getItem('sr_token')||'';if(t)h['X-Token']=t;return h;}
 function tokQ(){const t=localStorage.getItem('sr_token')||'';return t?{headers:{'X-Token':t}}:{}}
-function toast(m,err){const t=$('toast');if(!t){alert(String(m).replace(/<[^>]*>/g,''));return;}t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',6000);}
+function toast(m,err){const t=$('toast');if(!t){alert(String(m).replace(/<[^>]*>/g,''));return;}t.innerHTML='<span class="'+(err?'err':'ok')+'">'+esc(m)+'</span>';clearTimeout(t._h);t._h=setTimeout(()=>t.innerHTML='',8000);}
+document.addEventListener('click',e=>{const h=e.target.closest?e.target.closest('.h'):null;if(h&&h.dataset.h)toast(h.dataset.h);});
 async function apiJSON(path,opts){const r=await fetch(path,opts);const t=await r.text();
 let d;try{d=t?JSON.parse(t):{}}catch(e){throw new Error(t.slice(0,160)||('HTTP '+r.status));}
 if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));return d;}
@@ -610,12 +620,12 @@ INDEX_BODY = """<div class="card"><h3>Schn&auml;ppchen-Watcher <span id="health"
 <b>Schritt 2:</b> Dort PLZ + Umkreis + Preis filtern, URL kopieren und unten einf&uuml;gen.
 <b>Schritt 3:</b> Testen, Abstand w&auml;hlen, speichern &mdash; fertig.</p>
 <div class="grid">
-<div><label>1. Anbieter <span class="h" title="Für welchen Marktplatz gilt die Suche? Erkennung geht auch automatisch per Domain.">?</span></label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select>
+<div><label>1. Anbieter <span class="h" data-h="Für welchen Marktplatz gilt die Suche? Erkennung geht auch automatisch per Domain.">?</span></label><select id="w_provider"><option value="auto">Automatisch (per Domain)</option></select>
 <div class="mut" id="w_phinweis"></div></div>
-<div><label>Suchbegriff <span class="h" title="Wonach suchst du? Z.B. ThinkPad T14, OSB-Platte, Golf 7. Wird für Suche-öffnen und Namensvorschlag genutzt.">?</span></label><input id="w_query" type="text" placeholder="z.B. ThinkPad T14">
+<div><label>Suchbegriff <span class="h" data-h="Wonach suchst du? Z.B. ThinkPad T14, OSB-Platte, Golf 7. Wird für Suche-öffnen und Namensvorschlag genutzt.">?</span></label><input id="w_query" type="text" placeholder="z.B. ThinkPad T14">
 <div><button id="b_quick" class="sec">Suche im Browser &ouml;ffnen</button></div></div>
 </div>
-<label>2. Kopierte Such-URL hier einf&uuml;gen <span class="h" title="Im geöffneten Tab: PLZ/Ort + Umkreis (z.B. 10 km), Preis und Sortierung 'Neueste zuerst' einstellen, dann die Adresse aus der Browser-Adresszeile kopieren.">?</span></label>
+<label>2. Kopierte Such-URL hier einf&uuml;gen <span class="h" data-h="Im geöffneten Tab: PLZ/Ort + Umkreis (z.B. 10 km), Preis und Sortierung 'Neueste zuerst' einstellen, dann die Adresse aus der Browser-Adresszeile kopieren.">?</span></label>
 <input id="w_url" type="text" placeholder="https://www.kleinanzeigen.de/s-laptop/...">
 <div><button id="b_preview" class="sec">URL testen (Treffer + Median anzeigen)</button></div>
 <div id="preview"></div>
@@ -628,7 +638,7 @@ INDEX_BODY = """<div class="card"><h3>Schn&auml;ppchen-Watcher <span id="health"
 <div id="r_pills">
 <button class="sec pill" data-v="5">5 km</button><button class="sec pill on" data-v="10">10 km</button><button class="sec pill" data-v="20">20 km</button><button class="sec pill" data-v="30">30 km</button><button class="sec pill" data-v="50">50 km</button><button class="sec pill" data-v="100">100 km</button>
 </div>
-<label>Deal-Schwelle: <b><span id="schw_val">25</span> %</b> unter Median <span class="h" title="Der Median ist der mittlere Preis aller Treffer. 25 % heißt: Nur Angebote, die mindestens ein Viertel unter dem üblichen Preis liegen, werden als Deal gemeldet.">?</span></label>
+<label>Deal-Schwelle: <b><span id="schw_val">25</span> %</b> unter Median <span class="h" data-h="So rechnet das Programm: Es sammelt alle Treffer mit Preis, sortiert sie und nimmt den mittleren Wert = Median. Beispiel: Treffer zu 400, 450, 500, 550, 900 Euro, Median = 500. Bei 25 % Schwelle meldet es alles bis 375 Euro als Deal. 0 Deals heißt: kein Treffer lag weit genug darunter (oder es wurden zu wenig Preise erkannt, siehe Treffer/Median in der Tabelle).">?</span></label>
 <input id="w_schwelle_r" type="range" min="5" max="70" value="25" style="width:100%">
 <label>3. Wie oft pr&uuml;fen? (Minimum 15 Min &mdash; Bot-Schutz)</label>
 <div id="i_pills">
@@ -712,7 +722,8 @@ d.forEach(w=>{const o=document.createElement('option');o.value=w.name;o.textCont
 if(!d.length){$('watches').innerHTML='<p class="mut">Noch keine Jobs. Lege oben deine erste Suche an.</p>';return;}
 let h='<table><tr><th>Job</th><th>Intervall</th><th>Zuletzt</th><th>N&auml;chster Lauf</th><th>Ergebnis</th><th>Status</th><th>Aktion</th></tr>';
 d.forEach(w=>{const s=w.summary||{};
-const erg=(s.angebote||0)+' Angebote'+(s.median?' &middot; Median '+s.median+' &euro;':'')+' &middot; <b>'+(s.deals||0)+' Deals</b>';
+const med=s.median?' &middot; Median '+s.median+' &euro;':' &middot; <span class="mut">kein Median (zu wenig Preise)</span>';
+const erg=(s.angebote||0)+' Treffer &middot; '+(s.mit_preis||0)+' mit Preis'+med+' &middot; <b>'+(s.deals||0)+' Deals</b>';
 h+='<tr><td><b>'+esc(w.name)+'</b>'+(w.enabled?'':' <span class="mut">(pausiert)</span>')+'<br><span class="mut">'+esc((w.query||'')+' '+(w.plz||'')+(w.radius_km?' +'+w.radius_km+'km':''))+'</span></td>'
 +'<td>alle '+w.interval_minutes+' Min</td><td>'+fmtT(w.last_run)+'</td><td>'+(w.enabled?fmtIn(w.next_run):'&ndash;')+'</td>'
 +'<td>'+erg+'</td><td>'+(w.last_status==='ok'?'<span class="ok">ok</span>':w.last_status==='nie'?'<span class="mut">wartet</span>':'<span class="err">'+esc(w.last_status)+'</span>')+(w.last_error?'<br><span class="mut">'+esc(w.last_error.slice(0,80))+'</span>':'')+'</td>'
@@ -747,18 +758,18 @@ const _eq=new URLSearchParams(location.search).get('edit');if(_eq)editWatch(_eq)
 
 SCRAPE_BODY = """<div class="card"><h3>Seite pr&uuml;fen <span id="health" class="mut"></span></h3>
 <div id="toast"></div>
-<label>URL <span class="h" title="Genaue Adresse der Seite aus der Browser-Adresszeile kopieren, z.B. https://shop.de/produkt/123.">?</span></label>
+<label>URL <span class="h" data-h="Genaue Adresse der Seite aus der Browser-Adresszeile kopieren, z.B. https://shop.de/produkt/123.">?</span></label>
 <input id="url" type="text" placeholder="https://shop.example/produkt/123">
 <div class="grid">
-<div><label>Preis-Selektor (optional) <span class="h" title="CSS-Selektor, der genau auf den Preis zeigt, z.B. .price. Leer lassen = Auto-Erkennung (JSON-LD, Meta, sichtbarer Preis). Finden: siehe Anleitung unten.">?</span></label><input id="s_preis" type="text" placeholder=".price"></div>
-<div><label>Verf&uuml;gbarkeit-Selektor (optional) <span class="h" title="CSS-Selektor für den Lager-Text, z.B. .stock oder .availability. Leer = automatische Textsuche (auf Lager, lieferbar, ausverkauft ...).">?</span></label><input id="s_avail" type="text" placeholder=".stock, .availability"></div>
-<div><label>Anzahl/Menge-Selektor (optional) <span class="h" title="CSS-Selektor für Mengen-/Stückzahl-Angaben, z.B. .qty. Nur wenn die Seite so etwas zeigt.">?</span></label><input id="s_qty" type="text" placeholder=".qty, .amount"></div>
-<div><label>Titel-Selektor (optional) <span class="h" title="CSS-Selektor für die Überschrift, z.B. h1. Leer = Seitentitel wird genommen.">?</span></label><input id="s_title" type="text" placeholder="h1"></div>
+<div><label>Preis-Selektor (optional) <span class="h" data-h="CSS-Selektor, der genau auf den Preis zeigt, z.B. .price. Leer lassen = Auto-Erkennung (JSON-LD, Meta, sichtbarer Preis). Finden: siehe Anleitung unten.">?</span></label><input id="s_preis" type="text" placeholder=".price"></div>
+<div><label>Verf&uuml;gbarkeit-Selektor (optional) <span class="h" data-h="CSS-Selektor für den Lager-Text, z.B. .stock oder .availability. Leer = automatische Textsuche (auf Lager, lieferbar, ausverkauft ...).">?</span></label><input id="s_avail" type="text" placeholder=".stock, .availability"></div>
+<div><label>Anzahl/Menge-Selektor (optional) <span class="h" data-h="CSS-Selektor für Mengen-/Stückzahl-Angaben, z.B. .qty. Nur wenn die Seite so etwas zeigt.">?</span></label><input id="s_qty" type="text" placeholder=".qty, .amount"></div>
+<div><label>Titel-Selektor (optional) <span class="h" data-h="CSS-Selektor für die Überschrift, z.B. h1. Leer = Seitentitel wird genommen.">?</span></label><input id="s_title" type="text" placeholder="h1"></div>
 </div>
-<label>Eigene Felder (je Zeile <i>feld=css-selektor</i>, optional) <span class="h" title="Eigene Werte auslesen, z.B. artikelnummer=.sku pro Zeile. Links der Feldname, rechts der CSS-Selektor.">?</span></label>
+<label>Eigene Felder (je Zeile <i>feld=css-selektor</i>, optional) <span class="h" data-h="Eigene Werte auslesen, z.B. artikelnummer=.sku pro Zeile. Links der Feldname, rechts der CSS-Selektor.">?</span></label>
 <textarea id="s_custom" rows="2" placeholder="artikelnummer=.sku&#10;bewertung=.stars"></textarea>
 <div class="grid">
-<div><label>Warten auf Selektor (optional) <span class="h" title="Wenn Preise per JavaScript nachladen: Selektor angeben, auf den gewartet wird (z.B. .price). Leer lassen wenn unsicher.">?</span></label><input id="waitfor" type="text" placeholder=".price"></div>
+<div><label>Warten auf Selektor (optional) <span class="h" data-h="Wenn Preise per JavaScript nachladen: Selektor angeben, auf den gewartet wird (z.B. .price). Leer lassen wenn unsicher.">?</span></label><input id="waitfor" type="text" placeholder=".price"></div>
 <div><label>API-Token (nur wenn in config.yaml gesetzt)</label><input id="token" type="text" placeholder="X-Token"></div>
 </div>
 <label><input id="fresh" type="checkbox"> Cache umgehen (fresh)</label>
@@ -860,7 +871,7 @@ Bearbeiten: Watches auf der <a href="/">Startseite</a> (oder ?edit=), Targets hi
 
 <div class="card mut">StealthScraper-LXC <span id="build"></span></div>"""
 
-JOBS_JS = """async function loadJobs(){try{const d=await apiJSON('/jobs',tokQ());
+JOBS_JS = """async function loadJobs(){try{const d=await apiJSON('/api/jobs',tokQ());
 let h='<table><tr><th>Job</th><th>Intervall</th><th>Zuletzt</th><th>N&auml;chster Lauf</th><th>Ergebnis</th><th>Status</th><th>Aktion</th></tr>';
 if(!d.watches.length)h+='<tr><td colspan="7"><span class="mut">Keine Watches — <a href="/">anlegen</a></span></td></tr>';
 d.watches.forEach(w=>{

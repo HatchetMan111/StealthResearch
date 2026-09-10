@@ -73,6 +73,7 @@ async def scheduler_loop(scraper_getter, db: WatchDB, stop_event: asyncio.Event)
                         db.set_state(name, "ok", "", {
                             "angebote": result.get("angebote_gesamt", 0),
                             "deals": len(result.get("deals", [])),
+                            "mit_preis": result.get("mit_preis", 0),
                             "median": result.get("median")})
                     except Exception as e:  # Watch darf Scheduler nie killen
                         db.set_state(name, "fehler", str(e))

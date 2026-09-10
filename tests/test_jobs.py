@@ -38,9 +38,10 @@ def test_state_summary_roundtrip():
     db = WatchDB(":memory:")
     st = db.get_state("neu")
     assert st["last_status"] == "nie" and st["last_run"] == 0
-    db.set_state("job1", "ok", "", {"angebote": 42, "deals": 3, "median": 450.5})
+    db.set_state("job1", "ok", "", {"angebote": 42, "deals": 3, "median": 450.5, "mit_preis": 40})
     st = db.get_state("job1")
     assert st["last_status"] == "ok"
     assert st["last_angebote"] == 42 and st["last_deals"] == 3
+    assert st["last_mitpreis"] == 40
     assert st["last_median"] == 450.5
     assert db.last_run("job1") > 0

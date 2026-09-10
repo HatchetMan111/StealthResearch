@@ -136,6 +136,7 @@ class WatchDB:
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(watch_state)").fetchall()}
         for col, typ in (("last_angebote", "INTEGER DEFAULT 0"),
                          ("last_deals", "INTEGER DEFAULT 0"),
+                         ("last_mitpreis", "INTEGER DEFAULT 0"),
                          ("last_median", "REAL")):
             if col not in cols:
                 self._db.execute(f"ALTER TABLE watch_state ADD COLUMN {col} {typ}")
@@ -246,26 +247,28 @@ class WatchDB:
         summary = summary or {}
         self._db.execute(
             """INSERT INTO watch_state (name, last_run, last_status, last_error,
-               last_angebote, last_deals, last_median) VALUES (?, ?, ?, ?, ?, ?, ?)
+               last_angebote, last_deals, last_mitpreis, last_median)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (name) DO UPDATE SET last_run=excluded.last_run,
                last_status=excluded.last_status, last_error=excluded.last_error,
                last_angebote=excluded.last_angebote, last_deals=excluded.last_deals,
-               last_median=excluded.last_median""",
+               last_mitpreis=excluded.last_mitpreis, last_median=excluded.last_median""",
             (name, int(time.time()), status, error[:500],
              int(summary.get("angebote", 0) or 0), int(summary.get("deals", 0) or 0),
-             summary.get("median")))
+             int(summary.get("mit_preis", 0) or 0), summary.get("median")))
         self._db.commit()
 
     def get_state(self, name: str) -> dict:
         row = self._db.execute(
-            "SELECT last_run, last_status, last_error, last_angebote, last_deals, last_median"
-            " FROM watch_state WHERE name=?", (name,)).fetchone()
+            "SELECT last_run, last_status, last_error, last_angebote, last_deals,"
+            " last_mitpreis, last_median FROM watch_state WHERE name=?", (name,)).fetchone()
         if not row:
             return {"last_run": 0, "last_status": "nie", "last_error": "",
-                    "last_angebote": 0, "last_deals": 0, "last_median": None}
+                    "last_angebote": 0, "last_deals": 0, "last_mitpreis": 0, "last_median": None}
         return {"last_run": int(row[0] or 0), "last_status": row[1] or "",
                 "last_error": row[2] or "", "last_angebote": int(row[3] or 0),
-                "last_deals": int(row[4] or 0), "last_median": row[5]}
+                "last_deals": int(row[4] or 0), "last_mitpreis": int(row[5] or 0),
+                "last_median": row[6]}
 
 
 def send_webhook(url: str, payload: dict) -> None:
